@@ -32,6 +32,23 @@ logger = get_logger("maibot_sns")
 
 # 缓存文件路径
 CACHE_FILE = Path(__file__).parent / "failed_writes.json"
+STATE_FILE = Path(__file__).parent / "collector_state.json"
+
+# 全局状态（用于 WebUI 和统计）
+_collector_stats: Dict[str, Any] = {
+    "last_collect_time": 0,
+    "total_collected": 0,
+    "total_written": 0,
+    "total_filtered": 0,
+    "total_duplicate": 0,
+    "last_result": None,
+    "is_running": False,
+    "recent_memories": [],  # 最近写入的记忆
+}
+
+# feed_id 缓存（避免重复查询数据库）
+_feed_id_cache: set = set()
+_feed_id_cache_loaded: bool = False
 
 
 # ============================================================================
@@ -74,6 +91,10 @@ class CollectResult:
 class SNSCollector:
     """SNS内容采集器"""
     
+    # 并发控制
+    MAX_CONCURRENT_DETAILS = 3  # 最大并发获取详情数
+    MAX_CONCURRENT_IMAGES = 2   # 最大并发识图数
+    
     def __init__(self, config: Dict[str, Any]):
         self.config = config
         self.platform = config.get("platform", {})
@@ -82,6 +103,79 @@ class SNSCollector:
         self.debug = config.get("debug", {}).get("enabled", False)
         self.processing_cfg = config.get("processing", {})
         self._personality_cache: Optional[Dict[str, str]] = None
+        self._semaphore_details = asyncio.Semaphore(self.MAX_CONCURRENT_DETAILS)
+        self._semaphore_images = asyncio.Semaphore(self.MAX_CONCURRENT_IMAGES)
+    
+    @staticmethod
+    def _load_feed_id_cache() -> None:
+        """加载 feed_id 缓存"""
+        global _feed_id_cache, _feed_id_cache_loaded
+        if _feed_id_cache_loaded:
+            return
+        
+        try:
+            # 从数据库加载已有的 feed_id
+            import asyncio
+            loop = asyncio.get_event_loop()
+            if loop.is_running():
+                # 如果在异步上下文中，标记为需要异步加载
+                _feed_id_cache_loaded = True
+                return
+            
+            # 同步加载（启动时）
+            _feed_id_cache_loaded = True
+        except Exception as e:
+            logger.warning(f"加载 feed_id 缓存失败: {e}")
+    
+    @staticmethod
+    async def _async_load_feed_id_cache() -> None:
+        """异步加载 feed_id 缓存"""
+        global _feed_id_cache, _feed_id_cache_loaded
+        if _feed_id_cache and len(_feed_id_cache) > 0:
+            return
+        
+        try:
+            records = await database_api.db_get(
+                ChatHistory,
+                filters={},
+                limit=2000,
+            )
+            
+            if records:
+                for r in records:
+                    chat_id = r.get("chat_id", "")
+                    if not str(chat_id).startswith("sns_"):
+                        continue
+                    key_point = r.get("key_point", "") or ""
+                    # 从 key_point 中提取 feed_id
+                    if "feed_id:" in key_point:
+                        import re
+                        match = re.search(r'feed_id:([a-zA-Z0-9]+)', key_point)
+                        if match:
+                            _feed_id_cache.add(match.group(1))
+            
+            logger.info(f"[SNS] 加载 feed_id 缓存: {len(_feed_id_cache)} 条")
+            _feed_id_cache_loaded = True
+        except Exception as e:
+            logger.warning(f"异步加载 feed_id 缓存失败: {e}")
+    
+    @staticmethod
+    def _load_state() -> Dict[str, Any]:
+        """加载采集状态"""
+        if STATE_FILE.exists():
+            try:
+                return json.loads(STATE_FILE.read_text())
+            except Exception:
+                pass
+        return {"last_feed_ids": {}, "last_collect_time": {}}
+    
+    @staticmethod
+    def _save_state(state: Dict[str, Any]) -> None:
+        """保存采集状态"""
+        try:
+            STATE_FILE.write_text(json.dumps(state, ensure_ascii=False, indent=2))
+        except Exception as e:
+            logger.warning(f"保存状态失败: {e}")
     
     def _get_personality(self) -> Dict[str, str]:
         """获取 MaiBot 人格配置"""
@@ -104,9 +198,31 @@ class SNSCollector:
         
         return self._personality_cache
     
-    async def collect(self, platform: str = "xiaohongshu", keyword: Optional[str] = None, count: int = 10) -> CollectResult:
-        """执行采集任务"""
+    async def collect(
+        self, 
+        platform: str = "xiaohongshu", 
+        keyword: Optional[str] = None, 
+        count: int = 10,
+        preview_only: bool = False,  # 预览模式，不写入数据库
+    ) -> CollectResult:
+        """执行采集任务
+        
+        Args:
+            platform: 平台名称
+            keyword: 搜索关键词
+            count: 采集数量
+            preview_only: 预览模式，只返回结果不写入
+        """
+        global _collector_stats
+        
         result = CollectResult(success=False)
+        
+        # 检查是否正在运行
+        if _collector_stats["is_running"]:
+            result.errors.append("采集任务正在运行中")
+            return result
+        
+        _collector_stats["is_running"] = True
         
         if self.debug:
             logger.info("=" * 60)
@@ -114,9 +230,12 @@ class SNSCollector:
             logger.info(f"[SNS]    平台: {platform}")
             logger.info(f"[SNS]    关键词: {keyword or '(推荐流)'}")
             logger.info(f"[SNS]    数量: {count}")
+            logger.info(f"[SNS]    预览模式: {preview_only}")
             logger.info("=" * 60)
         
         try:
+            # 加载 feed_id 缓存
+            await self._async_load_feed_id_cache()
             # 1. 获取内容
             if self.debug:
                 logger.info("[SNS] 📥 阶段1: 获取信息流...")
@@ -180,30 +299,68 @@ class SNSCollector:
                     logger.info("[SNS] 📄 阶段4: 获取详情（正文+图片）...")
                 filtered = await self._fetch_details(filtered, platform)
             
-            # 5. 写入记忆
+            # 5. 写入记忆（或预览）
             if self.debug:
                 logger.info("-" * 60)
-                logger.info("[SNS] 💾 阶段5: 写入记忆...")
+                if preview_only:
+                    logger.info("[SNS] 👁️ 阶段5: 预览模式（不写入）...")
+                else:
+                    logger.info("[SNS] 💾 阶段5: 写入记忆...")
+            
+            # 存储预览内容
+            result.preview_contents = []  # type: ignore
             
             for content in filtered:
                 try:
-                    is_dup = await self._check_duplicate(content)
+                    # 使用缓存检查重复
+                    is_dup = self._check_duplicate_cached(content)
                     if is_dup:
                         if self.debug:
                             logger.info(f"[SNS]    ⏭️ 跳过重复: {content.title[:30]}...")
                         result.duplicate += 1
                         continue
                     
-                    await self._write_to_memory(content, platform)
-                    result.written += 1
+                    if preview_only:
+                        # 预览模式：只收集内容，不写入
+                        result.preview_contents.append({  # type: ignore
+                            "feed_id": content.feed_id,
+                            "title": content.title,
+                            "content": content.content[:200],
+                            "author": content.author,
+                            "like_count": content.like_count,
+                            "image_count": len(content.image_urls),
+                        })
+                        result.written += 1
+                    else:
+                        await self._write_to_memory(content, platform)
+                        result.written += 1
+                        # 添加到缓存
+                        _feed_id_cache.add(content.feed_id)
+                        # 记录最近写入的记忆
+                        _collector_stats["recent_memories"].append({
+                            "title": content.title[:50],
+                            "author": content.author,
+                            "time": time.time(),
+                        })
+                        # 只保留最近 20 条
+                        _collector_stats["recent_memories"] = _collector_stats["recent_memories"][-20:]
+                    
                     if self.debug:
-                        logger.info(f"[SNS]    ✅ 写入成功: {content.title[:30]}...")
+                        logger.info(f"[SNS]    ✅ {'预览' if preview_only else '写入'}成功: {content.title[:30]}...")
                         logger.info(f"[SNS]       正文: {content.content[:80]}{'...' if len(content.content) > 80 else ''}")
                 except Exception as e:
                     logger.error(f"[SNS]    ❌ 写入失败: {e}")
                     result.errors.append(f"写入失败: {e}")
             
             result.success = True
+            
+            # 更新统计
+            _collector_stats["last_collect_time"] = time.time()
+            _collector_stats["total_collected"] += result.fetched
+            _collector_stats["total_written"] += result.written
+            _collector_stats["total_filtered"] += result.filtered
+            _collector_stats["total_duplicate"] += result.duplicate
+            _collector_stats["last_result"] = result.summary()
             
             if self.debug:
                 logger.info("=" * 60)
@@ -214,8 +371,16 @@ class SNSCollector:
         except Exception as e:
             logger.error(f"采集失败: {e}")
             result.errors.append(str(e))
+        finally:
+            _collector_stats["is_running"] = False
         
         return result
+    
+    def _check_duplicate_cached(self, content: SNSContent) -> bool:
+        """使用缓存检查是否重复（快速）"""
+        if not content.feed_id:
+            return False
+        return content.feed_id in _feed_id_cache
     
     async def _fetch_contents(self, platform: str, keyword: Optional[str], count: int) -> List[SNSContent]:
         """通过MCP工具获取内容"""
@@ -341,7 +506,7 @@ class SNSCollector:
         return contents
     
     async def _fetch_details(self, contents: List[SNSContent], platform: str) -> List[SNSContent]:
-        """获取内容详情（补充正文）"""
+        """获取内容详情（补充正文）- 并发版本"""
         mcp_prefix = self.platform.get(platform, {}).get("mcp_server_name", platform)
         tool_name = f"{mcp_prefix}_get_feed_detail"
         
@@ -353,45 +518,51 @@ class SNSCollector:
         
         if self.debug:
             logger.info(f"[SNS]    使用工具: {tool_name}")
+            logger.info(f"[SNS]    并发数: {self.MAX_CONCURRENT_DETAILS}")
         
-        updated = []
-        for i, content in enumerate(contents):
-            try:
-                if self.debug:
-                    logger.info(f"[SNS]    [{i+1}/{len(contents)}] 获取: {content.title[:30]}...")
-                
-                result = await tool.direct_execute(
-                    feed_id=content.feed_id,
-                    xsec_token=content.xsec_token
-                )
-                
-                content_str = result.get("content", "") if isinstance(result, dict) else str(result)
-                
-                # 解析详情
-                detail = self._parse_feed_detail(content_str)
-                if detail:
-                    old_len = len(content.content)
-                    # 更新正文内容
-                    if detail.get("desc"):
-                        content.content = detail["desc"]
-                    if detail.get("images"):
-                        content.image_urls = detail["images"]
+        async def fetch_single_detail(idx: int, content: SNSContent) -> SNSContent:
+            """获取单个内容的详情"""
+            async with self._semaphore_details:
+                try:
+                    if self.debug:
+                        logger.info(f"[SNS]    [{idx+1}/{len(contents)}] 获取: {content.title[:30]}...")
                     
+                    result = await tool.direct_execute(
+                        feed_id=content.feed_id,
+                        xsec_token=content.xsec_token
+                    )
+                    
+                    content_str = result.get("content", "") if isinstance(result, dict) else str(result)
+                    
+                    # 解析详情
+                    detail = self._parse_feed_detail(content_str)
+                    if detail:
+                        old_len = len(content.content)
+                        # 更新正文内容
+                        if detail.get("desc"):
+                            content.content = detail["desc"]
+                        if detail.get("images"):
+                            content.image_urls = detail["images"]
+                        
+                        if self.debug:
+                            logger.info(f"[SNS]        ✓ 正文: {old_len} → {len(content.content)} 字")
+                            logger.info(f"[SNS]        ✓ 图片: {len(content.image_urls)} 张")
+                    else:
+                        if self.debug:
+                            logger.info(f"[SNS]        ⚠️ 详情解析失败，保留原内容")
+                    
+                    return content
+                    
+                except Exception as e:
                     if self.debug:
-                        logger.info(f"[SNS]        ✓ 正文: {old_len} → {len(content.content)} 字")
-                        logger.info(f"[SNS]        ✓ 图片: {len(content.image_urls)} 张")
-                else:
-                    if self.debug:
-                        logger.info(f"[SNS]        ⚠️ 详情解析失败，保留原内容")
-                
-                updated.append(content)
-                
-            except Exception as e:
-                if self.debug:
-                    logger.warning(f"[SNS]        ❌ 获取失败: {e}")
-                updated.append(content)  # 即使失败也保留原内容
+                        logger.warning(f"[SNS]        ❌ 获取失败: {e}")
+                    return content  # 即使失败也保留原内容
         
-        return updated
+        # 并发获取所有详情
+        tasks = [fetch_single_detail(i, c) for i, c in enumerate(contents)]
+        updated = await asyncio.gather(*tasks)
+        
+        return list(updated)
     
     def _parse_feed_detail(self, result: str) -> Optional[Dict]:
         """解析详情返回"""
@@ -946,6 +1117,82 @@ class SNSCleanupTool(BaseTool):
         return await self.execute(kwargs)
 
 
+class SNSStatusTool(BaseTool):
+    """SNS 状态查询工具（供 WebUI 调用）"""
+    
+    name = "sns_get_status"
+    description = "获取 SNS 采集插件的运行状态和统计信息"
+    parameters = [
+        ("action", ToolParamType.STRING, "操作类型: stats/memories/trigger", False, ["stats", "memories", "trigger"]),
+        ("keyword", ToolParamType.STRING, "触发采集时的搜索关键词（可选）", False, None),
+    ]
+    available_for_llm = False
+    
+    async def execute(self, function_args: dict) -> dict:
+        action = function_args.get("action", "stats")
+        
+        if action == "stats":
+            # 返回统计信息
+            stats = _collector_stats.copy()
+            stats["feed_id_cache_size"] = len(_feed_id_cache)
+            
+            # 获取数据库中的记忆数量
+            try:
+                records = await database_api.db_get(ChatHistory, limit=2000)
+                sns_records = [r for r in (records or []) if str(r.get("chat_id", "")).startswith("sns_")]
+                stats["total_memories"] = len(sns_records)
+                
+                # 按平台统计
+                by_platform = {}
+                for r in sns_records:
+                    p = r.get("chat_id", "").replace("sns_", "")
+                    by_platform[p] = by_platform.get(p, 0) + 1
+                stats["by_platform"] = by_platform
+            except Exception:
+                stats["total_memories"] = 0
+                stats["by_platform"] = {}
+            
+            return {"name": self.name, "content": json.dumps(stats, ensure_ascii=False)}
+        
+        elif action == "memories":
+            # 返回最近的记忆列表
+            try:
+                records = await database_api.db_get(
+                    ChatHistory,
+                    filters={},
+                    order_by="-start_time",
+                    limit=50,
+                )
+                
+                sns_records = []
+                for r in (records or []):
+                    if not str(r.get("chat_id", "")).startswith("sns_"):
+                        continue
+                    sns_records.append({
+                        "id": r.get("id"),
+                        "platform": r.get("chat_id", "").replace("sns_", ""),
+                        "theme": r.get("theme", ""),
+                        "summary": r.get("summary", "")[:200],
+                        "time": r.get("start_time", 0),
+                    })
+                
+                return {"name": self.name, "content": json.dumps(sns_records[:20], ensure_ascii=False)}
+            except Exception as e:
+                return {"name": self.name, "content": json.dumps({"error": str(e)})}
+        
+        elif action == "trigger":
+            # 触发采集
+            keyword = function_args.get("keyword")
+            collector = SNSCollector(_get_config())
+            result = await collector.collect(keyword=keyword if keyword else None)
+            return {"name": self.name, "content": result.summary()}
+        
+        return {"name": self.name, "content": "unknown action"}
+    
+    async def direct_execute(self, **kwargs) -> dict:
+        return await self.execute(kwargs)
+
+
 # ============================================================================
 # 命令处理器
 # ============================================================================
@@ -955,7 +1202,7 @@ class SNSCommand(BaseCommand):
     
     command_name = "sns_command"
     command_description = "社交平台采集命令"
-    command_pattern = r"^[/／]sns(?:\s+(?P<action>collect|search|status|cleanup|config|dream))?(?:\s+(?P<arg>.+))?$"
+    command_pattern = r"^[/／]sns(?:\s+(?P<action>collect|search|status|cleanup|config|dream|preview|stats))?(?:\s+(?P<arg>.+))?$"
     
     async def execute(self) -> Tuple[bool, str, bool]:
         action = self.matched_groups.get("action", "collect")
@@ -967,6 +1214,52 @@ class SNSCommand(BaseCommand):
         if action == "collect":
             result = await collector.collect()
             await self.send_text(f"SNS采集完成\n{result.summary()}")
+        
+        elif action == "preview":
+            # 预览模式：只获取内容，不写入数据库
+            await self.send_text("👁️ 预览模式：获取内容中...")
+            result = await collector.collect(keyword=arg if arg else None, preview_only=True)
+            
+            if hasattr(result, 'preview_contents') and result.preview_contents:  # type: ignore
+                preview_text = f"📋 预览结果 ({len(result.preview_contents)} 条):\n\n"  # type: ignore
+                for i, item in enumerate(result.preview_contents[:5]):  # type: ignore
+                    preview_text += f"{i+1}. 【{item['title'][:30]}】\n"
+                    preview_text += f"   👍 {item['like_count']} | @{item['author']} | 📷 {item['image_count']}张\n"
+                    preview_text += f"   {item['content'][:50]}...\n\n"
+                
+                if len(result.preview_contents) > 5:  # type: ignore
+                    preview_text += f"... 还有 {len(result.preview_contents) - 5} 条\n"  # type: ignore
+                preview_text += "\n使用 /sns collect 确认写入"
+                await self.send_text(preview_text)
+            else:
+                await self.send_text(f"预览完成\n{result.summary()}\n（无符合条件的内容）")
+        
+        elif action == "stats":
+            # 显示采集统计
+            stats = _collector_stats
+            last_time = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(stats["last_collect_time"])) if stats["last_collect_time"] else "从未"
+            
+            stats_text = (
+                f"📊 SNS 采集统计\n"
+                f"━━━━━━━━━━━━━━━━━━\n"
+                f"上次采集: {last_time}\n"
+                f"运行状态: {'🟢 运行中' if stats['is_running'] else '⚪ 空闲'}\n"
+                f"━━━━━━━━━━━━━━━━━━\n"
+                f"累计获取: {stats['total_collected']} 条\n"
+                f"累计写入: {stats['total_written']} 条\n"
+                f"累计过滤: {stats['total_filtered']} 条\n"
+                f"累计重复: {stats['total_duplicate']} 条\n"
+                f"━━━━━━━━━━━━━━━━━━\n"
+                f"缓存 feed_id: {len(_feed_id_cache)} 条\n"
+            )
+            
+            if stats["recent_memories"]:
+                stats_text += f"\n📝 最近写入:\n"
+                for mem in stats["recent_memories"][-5:]:
+                    mem_time = time.strftime("%H:%M", time.localtime(mem["time"]))
+                    stats_text += f"  [{mem_time}] {mem['title'][:25]}...\n"
+            
+            await self.send_text(stats_text)
         
         elif action == "dream":
             # 模拟做梦式采集：带人格兴趣匹配的采集
@@ -1022,7 +1315,19 @@ class SNSCommand(BaseCommand):
             await self.send_text(config_info)
             
         else:
-            await self.send_text("用法: /sns [collect|search <关键词>|status|cleanup|config|dream]")
+            help_text = (
+                "📱 SNS 采集命令\n"
+                "━━━━━━━━━━━━━━━━━━\n"
+                "/sns collect     - 采集推荐内容\n"
+                "/sns preview     - 预览内容（不写入）\n"
+                "/sns search <词> - 搜索特定内容\n"
+                "/sns dream       - 做梦式采集\n"
+                "/sns stats       - 查看采集统计\n"
+                "/sns status      - 查看记忆统计\n"
+                "/sns cleanup [天] - 清理旧记忆\n"
+                "/sns config      - 查看配置"
+            )
+            await self.send_text(help_text)
         
         return True, "命令执行完成", True
 
@@ -1611,6 +1916,7 @@ class MaiBotSNSPlugin(BasePlugin):
         return [
             (SNSCollectTool.get_tool_info(), SNSCollectTool),
             (SNSCleanupTool.get_tool_info(), SNSCleanupTool),
+            (SNSStatusTool.get_tool_info(), SNSStatusTool),
             (SNSCommand.get_command_info(), SNSCommand),
             (SNSStartupHandler.get_handler_info(), SNSStartupHandler),
             (SNSShutdownHandler.get_handler_info(), SNSShutdownHandler),
