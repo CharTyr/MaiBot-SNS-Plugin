@@ -24,6 +24,38 @@ fetch_detail = true                     # 是否获取笔记详情
                                         # 开启后会调用 get_feed_detail 获取完整正文
                                         # 关闭则只使用列表中的简短描述
 
+# 自定义工具名（可选，默认使用标准名称）
+# [platform.xiaohongshu.tools]
+# list = "list_feeds"                   # 获取列表的工具后缀
+# search = "search_feeds"               # 搜索的工具后缀
+# detail = "get_feed_detail"            # 获取详情的工具后缀
+
+# ============================================================================
+# 添加其他平台示例（通用配置）
+# ============================================================================
+# 你可以添加任何提供类似 API 的 MCP 服务器
+# 插件会自动尝试解析返回的 JSON 数据
+
+# [platform.weibo]
+# enabled = false
+# mcp_server_name = "mcp_weibo"
+# fetch_detail = true
+# # 自定义字段映射（如果 API 返回的字段名不同）
+# [platform.weibo.field_mapping]
+# feed_id = ["id", "mid"]
+# title = ["text", "content"]
+# author = ["user.screen_name", "user.name"]
+# like_count = ["attitudes_count", "like_count"]
+
+# [platform.bilibili]
+# enabled = false
+# mcp_server_name = "mcp_bilibili"
+# fetch_detail = true
+# [platform.bilibili.tools]
+# list = "get_recommend"
+# search = "search_video"
+# detail = "get_video_info"
+
 # ============================================================================
 # 内容过滤配置
 # ============================================================================

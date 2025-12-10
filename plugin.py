@@ -57,16 +57,17 @@ _feed_id_cache_loaded: bool = False
 
 @dataclass
 class SNSContent:
-    """社交平台内容"""
-    feed_id: str
-    platform: str
-    title: str
-    content: str
-    author: str
-    like_count: int = 0
-    comment_count: int = 0
-    image_urls: List[str] = field(default_factory=list)
-    xsec_token: str = ""
+    """社交平台内容（通用格式）"""
+    feed_id: str           # 内容唯一标识
+    platform: str          # 平台名称
+    title: str             # 标题
+    content: str           # 正文内容
+    author: str            # 作者
+    like_count: int = 0    # 点赞/喜欢数
+    comment_count: int = 0 # 评论数
+    image_urls: List[str] = field(default_factory=list)  # 图片列表
+    url: str = ""          # 原文链接
+    extra: Dict[str, Any] = field(default_factory=dict)  # 额外数据（平台特定）
 
 
 @dataclass
@@ -78,6 +79,7 @@ class CollectResult:
     filtered: int = 0
     duplicate: int = 0
     errors: List[str] = field(default_factory=list)
+    preview_contents: List[Dict] = field(default_factory=list)  # 预览内容
     
     def summary(self) -> str:
         status = "✅" if self.success else "❌"
@@ -85,11 +87,271 @@ class CollectResult:
 
 
 # ============================================================================
+# 平台适配器（支持多平台扩展）
+# ============================================================================
+
+class PlatformAdapter:
+    """平台适配器基类 - 定义如何解析不同平台的数据"""
+    
+    platform_name: str = "generic"
+    
+    # 工具名映射（可在配置中覆盖）
+    default_tools = {
+        "list": "list_feeds",      # 获取列表
+        "search": "search_feeds",  # 搜索
+        "detail": "get_feed_detail",  # 获取详情
+    }
+    
+    # 字段映射（从 MCP 返回数据映射到 SNSContent）
+    field_mapping = {
+        "feed_id": ["id", "note_id", "feed_id", "item_id"],
+        "title": ["title", "displayTitle", "name", "headline"],
+        "content": ["content", "desc", "description", "text", "body"],
+        "author": ["author", "nickname", "user.nickname", "user.name", "creator"],
+        "like_count": ["likedCount", "like_count", "likes", "interactInfo.likedCount"],
+        "comment_count": ["commentCount", "comment_count", "comments", "interactInfo.commentCount"],
+        "images": ["images", "imageList", "image_list", "cover", "pics"],
+        "url": ["url", "link", "webUrl", "share_url"],
+    }
+    
+    def __init__(self, config: Dict[str, Any]):
+        self.config = config
+        # 允许配置覆盖默认映射
+        custom_mapping = config.get("field_mapping", {})
+        if custom_mapping:
+            self.field_mapping = {**self.field_mapping, **custom_mapping}
+        custom_tools = config.get("tools", {})
+        if custom_tools:
+            self.default_tools = {**self.default_tools, **custom_tools}
+    
+    def _get_nested_value(self, data: Dict, path: str) -> Any:
+        """获取嵌套字典的值，支持点号路径如 'user.nickname'"""
+        keys = path.split(".")
+        value = data
+        for key in keys:
+            if isinstance(value, dict):
+                value = value.get(key)
+            else:
+                return None
+        return value
+    
+    def _extract_field(self, data: Dict, field_name: str) -> Any:
+        """从数据中提取字段，尝试多个可能的键名"""
+        paths = self.field_mapping.get(field_name, [field_name])
+        for path in paths:
+            value = self._get_nested_value(data, path)
+            if value is not None:
+                return value
+        return None
+    
+    def parse_list_result(self, result: str) -> List[SNSContent]:
+        """解析列表结果（通用实现）"""
+        contents = []
+        
+        if not result or not result.strip():
+            return contents
+        
+        try:
+            data = json.loads(result)
+            
+            # 支持多种返回格式
+            if isinstance(data, list):
+                items = data
+            elif isinstance(data, dict):
+                # 尝试多种可能的列表字段
+                for key in ["items", "feeds", "notes", "data", "list", "results"]:
+                    if key in data and isinstance(data[key], list):
+                        items = data[key]
+                        break
+                else:
+                    items = [data]  # 单条数据
+            else:
+                return contents
+            
+            for item in items:
+                if not isinstance(item, dict):
+                    continue
+                
+                content = self._parse_item(item)
+                if content and content.feed_id:
+                    contents.append(content)
+                    
+        except json.JSONDecodeError:
+            logger.debug(f"非JSON格式结果，长度={len(result)}")
+        except Exception as e:
+            logger.warning(f"解析列表结果失败: {e}")
+        
+        return contents
+    
+    def _parse_item(self, item: Dict) -> Optional[SNSContent]:
+        """解析单个内容项（可被子类覆盖）"""
+        feed_id = str(self._extract_field(item, "feed_id") or "")
+        if not feed_id:
+            return None
+        
+        # 提取点赞数
+        like_count = self._extract_field(item, "like_count") or 0
+        if isinstance(like_count, str):
+            like_count = self._parse_count(like_count)
+        
+        # 提取评论数
+        comment_count = self._extract_field(item, "comment_count") or 0
+        if isinstance(comment_count, str):
+            comment_count = self._parse_count(comment_count)
+        
+        # 提取图片
+        images = []
+        img_data = self._extract_field(item, "images")
+        if img_data:
+            images = self._extract_images(img_data)
+        
+        return SNSContent(
+            feed_id=feed_id,
+            platform=self.platform_name,
+            title=str(self._extract_field(item, "title") or ""),
+            content=str(self._extract_field(item, "content") or ""),
+            author=str(self._extract_field(item, "author") or ""),
+            like_count=int(like_count),
+            comment_count=int(comment_count),
+            image_urls=images,
+            url=str(self._extract_field(item, "url") or ""),
+            extra=item,  # 保留原始数据
+        )
+    
+    def _parse_count(self, count_str: str) -> int:
+        """解析数量字符串（处理 '1.5万' 等格式）"""
+        try:
+            count_str = count_str.replace(",", "").strip()
+            if "万" in count_str:
+                return int(float(count_str.replace("万", "")) * 10000)
+            if "k" in count_str.lower():
+                return int(float(count_str.lower().replace("k", "")) * 1000)
+            return int(float(count_str))
+        except (ValueError, AttributeError):
+            return 0
+    
+    def _extract_images(self, img_data: Any) -> List[str]:
+        """提取图片 URL 列表"""
+        images = []
+        
+        if isinstance(img_data, str):
+            images.append(img_data)
+        elif isinstance(img_data, list):
+            for img in img_data:
+                if isinstance(img, str):
+                    images.append(img)
+                elif isinstance(img, dict):
+                    # 尝试多种 URL 字段
+                    for key in ["urlDefault", "url", "src", "originUrl", "url_default"]:
+                        if img.get(key):
+                            images.append(img[key])
+                            break
+        elif isinstance(img_data, dict):
+            for key in ["urlDefault", "url", "src"]:
+                if img_data.get(key):
+                    images.append(img_data[key])
+                    break
+        
+        return images
+    
+    def parse_detail_result(self, result: str, content: SNSContent) -> SNSContent:
+        """解析详情结果，更新 content"""
+        try:
+            data = json.loads(result)
+            
+            # 尝试找到主要数据
+            detail = None
+            if isinstance(data, dict):
+                for key in ["data", "note", "detail", "item"]:
+                    if key in data:
+                        detail = data[key]
+                        if isinstance(detail, dict) and "note" in detail:
+                            detail = detail["note"]
+                        break
+                if not detail:
+                    detail = data
+            
+            if detail:
+                # 更新正文
+                new_content = self._extract_field(detail, "content")
+                if new_content:
+                    content.content = str(new_content)
+                
+                # 更新图片
+                img_data = self._extract_field(detail, "images")
+                if img_data:
+                    content.image_urls = self._extract_images(img_data)
+                
+                # 更新 extra
+                content.extra.update(detail)
+                
+        except Exception as e:
+            logger.debug(f"解析详情失败: {e}")
+        
+        return content
+    
+    def get_content_url(self, content: SNSContent) -> str:
+        """获取内容的原始链接"""
+        if content.url:
+            return content.url
+        return ""
+
+
+class XiaohongshuAdapter(PlatformAdapter):
+    """小红书平台适配器"""
+    
+    platform_name = "xiaohongshu"
+    
+    field_mapping = {
+        "feed_id": ["id", "note_id"],
+        "title": ["noteCard.displayTitle", "displayTitle", "title"],
+        "content": ["noteCard.desc", "desc", "content"],
+        "author": ["noteCard.user.nickname", "user.nickname", "nickname"],
+        "like_count": ["noteCard.interactInfo.likedCount", "interactInfo.likedCount", "likedCount"],
+        "comment_count": ["noteCard.interactInfo.commentCount", "interactInfo.commentCount", "commentCount"],
+        "images": ["noteCard.cover", "cover", "imageList", "images"],
+        "url": [],
+    }
+    
+    def _parse_item(self, item: Dict) -> Optional[SNSContent]:
+        """小红书特定解析"""
+        # 小红书的数据可能在 noteCard 中
+        note_card = item.get("noteCard", {})
+        if note_card:
+            # 合并 noteCard 数据到 item
+            merged = {**item, **note_card}
+            merged["noteCard"] = note_card  # 保留原始结构
+        else:
+            merged = item
+        
+        content = super()._parse_item(merged)
+        if content:
+            # 保存 xsec_token 用于获取详情
+            content.extra["xsec_token"] = item.get("xsecToken", "")
+        return content
+    
+    def get_content_url(self, content: SNSContent) -> str:
+        return f"https://xiaohongshu.com/explore/{content.feed_id}"
+
+
+# 平台适配器注册表
+PLATFORM_ADAPTERS: Dict[str, Type[PlatformAdapter]] = {
+    "xiaohongshu": XiaohongshuAdapter,
+    "generic": PlatformAdapter,
+}
+
+def get_platform_adapter(platform: str, config: Dict[str, Any]) -> PlatformAdapter:
+    """获取平台适配器"""
+    adapter_class = PLATFORM_ADAPTERS.get(platform, PlatformAdapter)
+    return adapter_class(config)
+
+
+# ============================================================================
 # 核心功能
 # ============================================================================
 
 class SNSCollector:
-    """SNS内容采集器"""
+    """SNS内容采集器 - 支持多平台"""
     
     # 并发控制
     MAX_CONCURRENT_DETAILS = 3  # 最大并发获取详情数
@@ -97,7 +359,7 @@ class SNSCollector:
     
     def __init__(self, config: Dict[str, Any]):
         self.config = config
-        self.platform = config.get("platform", {})
+        self.platform_cfg = config.get("platform", {})
         self.filter_cfg = config.get("filter", {})
         self.memory_cfg = config.get("memory", {})
         self.debug = config.get("debug", {}).get("enabled", False)
@@ -105,6 +367,14 @@ class SNSCollector:
         self._personality_cache: Optional[Dict[str, str]] = None
         self._semaphore_details = asyncio.Semaphore(self.MAX_CONCURRENT_DETAILS)
         self._semaphore_images = asyncio.Semaphore(self.MAX_CONCURRENT_IMAGES)
+        self._adapters: Dict[str, PlatformAdapter] = {}
+    
+    def _get_adapter(self, platform: str) -> PlatformAdapter:
+        """获取或创建平台适配器"""
+        if platform not in self._adapters:
+            platform_config = self.platform_cfg.get(platform, {})
+            self._adapters[platform] = get_platform_adapter(platform, platform_config)
+        return self._adapters[platform]
     
     @staticmethod
     def _load_feed_id_cache() -> None:
@@ -383,18 +653,25 @@ class SNSCollector:
         return content.feed_id in _feed_id_cache
     
     async def _fetch_contents(self, platform: str, keyword: Optional[str], count: int) -> List[SNSContent]:
-        """通过MCP工具获取内容"""
+        """通过MCP工具获取内容（使用平台适配器）"""
         contents = []
         result = None
         
-        # 获取MCP工具名前缀
-        mcp_prefix = self.platform.get(platform, {}).get("mcp_server_name", platform)
+        # 获取平台适配器
+        adapter = self._get_adapter(platform)
         
-        # 调用MCP工具
+        # 获取MCP工具名前缀和工具名
+        platform_config = self.platform_cfg.get(platform, {})
+        mcp_prefix = platform_config.get("mcp_server_name", platform)
+        
+        # 获取工具名（支持自定义）
+        tools_config = platform_config.get("tools", {})
         if keyword:
-            tool_name = f"{mcp_prefix}_search_feeds"
+            tool_suffix = tools_config.get("search", adapter.default_tools.get("search", "search_feeds"))
         else:
-            tool_name = f"{mcp_prefix}_list_feeds"
+            tool_suffix = tools_config.get("list", adapter.default_tools.get("list", "list_feeds"))
+        
+        tool_name = f"{mcp_prefix}_{tool_suffix}"
         
         if self.debug:
             logger.info(f"[SNS Debug] 调用工具: {tool_name}")
@@ -425,90 +702,25 @@ class SNSCollector:
             logger.warning(f"MCP工具返回错误: {content_str[:100]}")
             return contents
         
-        contents = self._parse_mcp_result(content_str, platform)
+        # 使用适配器解析结果
+        contents = adapter.parse_list_result(content_str)
+        
+        # 设置平台名
+        for c in contents:
+            c.platform = platform
         
         return contents[:count]
     
-    def _parse_mcp_result(self, result: str, platform: str) -> List[SNSContent]:
-        """解析MCP返回结果"""
-        contents = []
-        
-        if not result or not result.strip():
-            return contents
-        
-        try:
-            data = json.loads(result)
-            
-            # 支持多种返回格式
-            if isinstance(data, list):
-                items = data
-            elif isinstance(data, dict):
-                items = data.get("items", data.get("feeds", data.get("notes", data.get("data", []))))
-                if not isinstance(items, list):
-                    items = [data]  # 单条数据
-            else:
-                return contents
-            
-            for item in items:
-                if not isinstance(item, dict):
-                    continue
-                
-                # 小红书的数据结构: item.noteCard 包含详细信息
-                note_card = item.get("noteCard", {})
-                user_info = note_card.get("user", {})
-                interact_info = note_card.get("interactInfo", {})
-                cover_info = note_card.get("cover", {})
-                
-                # 提取feed_id
-                feed_id = str(item.get("id", item.get("note_id", "")))
-                if not feed_id:
-                    continue
-                
-                # 提取点赞数（从 interactInfo.likedCount）
-                like_count = interact_info.get("likedCount", item.get("likedCount", 0))
-                if isinstance(like_count, str):
-                    # 处理可能的小数格式如 "1.60000"
-                    like_count = int(float(like_count.replace(",", "").replace("万", "0000") or 0))
-                
-                # 提取评论数
-                comment_count = interact_info.get("commentCount", item.get("commentCount", 0))
-                if isinstance(comment_count, str):
-                    comment_count = int(float(comment_count.replace(",", "") or 0))
-                
-                # 提取标题（从 noteCard.displayTitle）
-                title = note_card.get("displayTitle", item.get("title", ""))
-                
-                # 提取作者（从 noteCard.user）
-                author = user_info.get("nickname", user_info.get("nickName", item.get("nickname", "")))
-                
-                # 提取封面图片
-                images = []
-                if cover_info.get("urlDefault"):
-                    images.append(cover_info["urlDefault"])
-                
-                contents.append(SNSContent(
-                    feed_id=feed_id,
-                    platform=platform,
-                    title=title,
-                    content=note_card.get("desc", item.get("desc", "")),
-                    author=author,
-                    like_count=int(like_count),
-                    comment_count=int(comment_count),
-                    image_urls=images,
-                    xsec_token=item.get("xsecToken", ""),
-                ))
-                
-        except json.JSONDecodeError:
-            logger.debug(f"非JSON格式结果，长度={len(result)}")
-        except Exception as e:
-            logger.warning(f"解析MCP结果失败: {e}")
-        
-        return contents
-    
     async def _fetch_details(self, contents: List[SNSContent], platform: str) -> List[SNSContent]:
-        """获取内容详情（补充正文）- 并发版本"""
-        mcp_prefix = self.platform.get(platform, {}).get("mcp_server_name", platform)
-        tool_name = f"{mcp_prefix}_get_feed_detail"
+        """获取内容详情（补充正文）- 并发版本，使用适配器"""
+        adapter = self._get_adapter(platform)
+        platform_config = self.platform_cfg.get(platform, {})
+        mcp_prefix = platform_config.get("mcp_server_name", platform)
+        
+        # 获取详情工具名
+        tools_config = platform_config.get("tools", {})
+        tool_suffix = tools_config.get("detail", adapter.default_tools.get("detail", "get_feed_detail"))
+        tool_name = f"{mcp_prefix}_{tool_suffix}"
         
         tool = tool_api.get_tool_instance(tool_name)
         if not tool:
@@ -527,29 +739,22 @@ class SNSCollector:
                     if self.debug:
                         logger.info(f"[SNS]    [{idx+1}/{len(contents)}] 获取: {content.title[:30]}...")
                     
-                    result = await tool.direct_execute(
-                        feed_id=content.feed_id,
-                        xsec_token=content.xsec_token
-                    )
+                    # 构建参数（从 extra 中获取平台特定参数）
+                    params = {"feed_id": content.feed_id}
+                    if content.extra.get("xsec_token"):
+                        params["xsec_token"] = content.extra["xsec_token"]
+                    
+                    result = await tool.direct_execute(**params)
                     
                     content_str = result.get("content", "") if isinstance(result, dict) else str(result)
                     
-                    # 解析详情
-                    detail = self._parse_feed_detail(content_str)
-                    if detail:
-                        old_len = len(content.content)
-                        # 更新正文内容
-                        if detail.get("desc"):
-                            content.content = detail["desc"]
-                        if detail.get("images"):
-                            content.image_urls = detail["images"]
-                        
-                        if self.debug:
-                            logger.info(f"[SNS]        ✓ 正文: {old_len} → {len(content.content)} 字")
-                            logger.info(f"[SNS]        ✓ 图片: {len(content.image_urls)} 张")
-                    else:
-                        if self.debug:
-                            logger.info(f"[SNS]        ⚠️ 详情解析失败，保留原内容")
+                    # 使用适配器解析详情
+                    old_len = len(content.content)
+                    content = adapter.parse_detail_result(content_str, content)
+                    
+                    if self.debug:
+                        logger.info(f"[SNS]        ✓ 正文: {old_len} → {len(content.content)} 字")
+                        logger.info(f"[SNS]        ✓ 图片: {len(content.image_urls)} 张")
                     
                     return content
                     
@@ -563,90 +768,6 @@ class SNSCollector:
         updated = await asyncio.gather(*tasks)
         
         return list(updated)
-    
-    def _parse_feed_detail(self, result: str) -> Optional[Dict]:
-        """解析详情返回"""
-        try:
-            data = json.loads(result)
-            
-            # 小红书详情结构: { feed_id, data: { note: {...}, comments: [...] } }
-            # 需要从 data.data.note 中获取内容
-            note = None
-            
-            # 尝试多种可能的数据路径
-            if isinstance(data, dict):
-                if "data" in data and isinstance(data["data"], dict):
-                    # 结构: { data: { note: {...} } }
-                    note = data["data"].get("note", {})
-                elif "note" in data:
-                    # 结构: { note: {...} }
-                    note = data["note"]
-                elif "noteCard" in data:
-                    # 结构: { noteCard: {...} }
-                    note = data["noteCard"]
-                else:
-                    # 直接使用顶层
-                    note = data
-            
-            if not note:
-                if self.debug:
-                    logger.warning(f"[SNS Debug] 无法找到 note 数据")
-                return None
-            
-            if self.debug:
-                logger.info(f"[SNS Debug] note keys: {list(note.keys())[:10]}")
-            
-            # 获取正文 - 尝试多种字段名
-            desc = ""
-            for field in ["desc", "description", "content", "text", "noteDesc"]:
-                if note.get(field):
-                    desc = note[field]
-                    if self.debug:
-                        logger.info(f"[SNS Debug] 找到正文字段: {field}, 长度: {len(desc)}")
-                    break
-            
-            # 获取图片列表
-            images = []
-            image_list = note.get("imageList") or note.get("images") or note.get("image_list") or []
-            
-            if self.debug and image_list:
-                logger.info(f"[SNS Debug] 图片列表: {len(image_list)} 张")
-                if image_list and isinstance(image_list[0], dict):
-                    logger.info(f"[SNS Debug] 图片项 keys: {list(image_list[0].keys())[:5]}")
-            
-            for img in image_list:
-                if isinstance(img, dict):
-                    # 尝试多种 URL 字段（优先使用 urlDefault）
-                    url = ""
-                    for url_field in ["urlDefault", "url_default", "url", "originUrl", "original_url", "urlPre"]:
-                        if img.get(url_field):
-                            url = img[url_field]
-                            break
-                    # 尝试从 infoList 获取
-                    if not url and img.get("infoList"):
-                        info_list = img["infoList"]
-                        if info_list and isinstance(info_list[0], dict):
-                            url = info_list[0].get("url", "")
-                    if url:
-                        images.append(url)
-                elif isinstance(img, str):
-                    images.append(img)
-            
-            if self.debug:
-                logger.info(f"[SNS Debug] 解析结果: desc长度={len(desc)}, images数量={len(images)}")
-            
-            return {
-                "desc": desc,
-                "images": images,
-            }
-        except json.JSONDecodeError as e:
-            if self.debug:
-                logger.warning(f"[SNS Debug] JSON解析失败: {e}, 原始内容前200字: {result[:200]}")
-            return None
-        except Exception as e:
-            if self.debug:
-                logger.warning(f"[SNS Debug] 详情解析异常: {e}")
-            return None
     
     def _filter_contents(self, contents: List[SNSContent]) -> List[SNSContent]:
         """过滤内容"""
@@ -821,7 +942,9 @@ class SNSCollector:
         chat_id = f"sns_{platform}"
         now = time.time()
         
-        url = self._get_content_url(content)
+        # 使用适配器获取 URL
+        adapter = self._get_adapter(platform)
+        url = adapter.get_content_url(content)
         full_summary = f"[来自{platform}] {summary}"
         if image_desc:
             full_summary += f"\n[图片内容] {image_desc}"
@@ -1011,12 +1134,6 @@ class SNSCollector:
                 unique.append(kw)
         
         return unique[:8]
-    
-    def _get_content_url(self, content: SNSContent) -> str:
-        """获取内容URL"""
-        if content.platform == "xiaohongshu":
-            return f"https://xiaohongshu.com/explore/{content.feed_id}"
-        return ""
     
     async def cleanup(self, days: int = 30, max_records: int = 1000) -> Tuple[int, int]:
         """清理旧记忆"""

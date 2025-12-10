@@ -4,7 +4,7 @@
 
 ## 功能特性
 
-- 🔗 通过 MCP 桥接采集小红书内容
+- 🔗 **多平台支持** - 通过 MCP 桥接采集小红书等平台内容，可扩展
 - 🧠 人格兴趣匹配 - 只学习 MaiBot 感兴趣的内容
 - 🖼️ 图片识别 - 使用 VLM 理解图片内容
 - 💾 写入 ChatHistory 记忆系统
@@ -187,9 +187,63 @@ enabled = true                        # 调试日志
 [SNS] 🎉 采集完成!
 ```
 
+## 扩展其他平台
+
+插件使用适配器架构，支持添加任何提供类似 API 的 MCP 服务器。
+
+### 添加新平台
+
+在 `config.toml` 中添加平台配置：
+
+```toml
+[platform.weibo]
+enabled = true
+mcp_server_name = "mcp_weibo"
+fetch_detail = true
+
+# 自定义工具名（如果不是标准的 list_feeds/search_feeds/get_feed_detail）
+[platform.weibo.tools]
+list = "get_timeline"
+search = "search_posts"
+detail = "get_post_detail"
+
+# 自定义字段映射（如果 API 返回的字段名不同）
+[platform.weibo.field_mapping]
+feed_id = ["id", "mid"]
+title = ["text"]
+author = ["user.screen_name"]
+like_count = ["attitudes_count"]
+```
+
+### 内置适配器
+
+- `xiaohongshu` - 小红书（已优化）
+- `generic` - 通用适配器（自动尝试解析常见字段）
+
+### 自定义适配器
+
+如需更复杂的解析逻辑，可以在 `plugin.py` 中添加自定义适配器类：
+
+```python
+class WeiboAdapter(PlatformAdapter):
+    platform_name = "weibo"
+    field_mapping = {
+        "feed_id": ["id", "mid"],
+        "title": ["text"],
+        # ...
+    }
+    
+    def _parse_item(self, item: Dict) -> Optional[SNSContent]:
+        # 自定义解析逻辑
+        pass
+
+# 注册适配器
+PLATFORM_ADAPTERS["weibo"] = WeiboAdapter
+```
+
 ## 注意事项
 
 1. 小红书 MCP Server 需要登录才能获取完整内容，请按照其文档完成登录
 2. 图片识别需要配置 VLM 模型（在 MaiBot 的 model_config.toml 中）
 3. 建议先手动测试成功后再开启定时任务
-
+4. 添加新平台时，确保 MCP 桥接插件已配置对应的 MCP 服务器
