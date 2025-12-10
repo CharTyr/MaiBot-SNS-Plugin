@@ -22,6 +22,7 @@ from src.plugin_system import (
     register_plugin,
     get_logger,
 )
+from src.plugin_system.base.config_types import ConfigSection
 from src.plugin_system.base.base_events_handler import BaseEventHandler
 from src.plugin_system.base.component_types import EventType
 from src.plugin_system.apis import tool_api, llm_api, database_api
@@ -1358,6 +1359,10 @@ class MaiBotSNSPlugin(BasePlugin):
     """MaiBot SNS插件"""
     
     plugin_name = "maibot_sns"
+    plugin_version = "1.0.0"
+    plugin_description = "社交平台内容采集与记忆写入插件，让 MaiBot 从小红书等平台学习知识"
+    plugin_author = "CharTyr"
+    display_name = "SNS 社交采集"
     enable_plugin = True
     dependencies = ["mcp_bridge_plugin"]
     python_dependencies = []
@@ -1368,37 +1373,236 @@ class MaiBotSNSPlugin(BasePlugin):
         global _plugin_instance
         _plugin_instance = self
     
+    # Section 描述（用于 WebUI 显示）
+    config_section_descriptions = {
+        "plugin": ConfigSection(
+            title="插件设置",
+            description="基础插件配置",
+            icon="settings",
+            order=0,
+        ),
+        "platform": ConfigSection(
+            title="平台配置",
+            description="配置要采集的社交平台",
+            icon="globe",
+            order=1,
+        ),
+        "filter": ConfigSection(
+            title="内容过滤",
+            description="设置过滤规则，只保存有价值的内容",
+            icon="filter",
+            order=2,
+        ),
+        "processing": ConfigSection(
+            title="内容处理",
+            description="LLM 摘要、图片识别等处理选项",
+            icon="cpu",
+            order=3,
+        ),
+        "memory": ConfigSection(
+            title="记忆存储",
+            description="记忆数量和清理设置",
+            icon="database",
+            order=4,
+        ),
+        "scheduler": ConfigSection(
+            title="定时任务",
+            description="自动采集任务配置",
+            icon="clock",
+            order=5,
+            collapsed=True,
+        ),
+        "dream": ConfigSection(
+            title="做梦集成",
+            description="做梦模块集成配置",
+            icon="moon",
+            order=6,
+            collapsed=True,
+        ),
+        "debug": ConfigSection(
+            title="调试",
+            description="调试日志配置",
+            icon="bug",
+            order=99,
+            collapsed=True,
+        ),
+    }
+    
     config_schema = {
         "plugin": {
-            "name": ConfigField(type=str, default="maibot_sns", description="插件名称"),
-            "version": ConfigField(type=str, default="1.0.0", description="版本"),
-            "enabled": ConfigField(type=bool, default=True, description="是否启用"),
+            "name": ConfigField(
+                type=str, default="maibot_sns",
+                description="插件名称",
+                hidden=True,
+            ),
+            "version": ConfigField(
+                type=str, default="1.0.0",
+                description="版本",
+                hidden=True,
+            ),
+            "enabled": ConfigField(
+                type=bool, default=True,
+                description="启用插件",
+                label="启用 SNS 采集插件",
+                order=0,
+            ),
         },
         "platform": {
-            "xiaohongshu": {
-                "enabled": ConfigField(type=bool, default=True, description="启用小红书"),
-                "mcp_server_name": ConfigField(type=str, default="xiaohongshu", description="MCP服务器名"),
-            },
+            "xiaohongshu.enabled": ConfigField(
+                type=bool, default=True,
+                description="启用小红书采集",
+                label="启用小红书",
+                hint="需要先配置 MCP 桥接插件中的小红书 MCP 服务器",
+                order=0,
+            ),
+            "xiaohongshu.mcp_server_name": ConfigField(
+                type=str, default="mcp_xiaohongshu",
+                description="MCP 服务器名称",
+                label="MCP 服务器名",
+                hint="与 MCP 桥接插件配置中的 name 对应",
+                placeholder="mcp_xiaohongshu",
+                order=1,
+            ),
+            "xiaohongshu.fetch_detail": ConfigField(
+                type=bool, default=True,
+                description="获取笔记详情",
+                label="获取完整正文",
+                hint="开启后会调用 get_feed_detail 获取完整正文和图片",
+                order=2,
+            ),
         },
         "filter": {
-            "min_like_count": ConfigField(type=int, default=100, description="最小点赞数"),
-            "keyword_whitelist": ConfigField(type=list, default=[], description="关键词白名单（优先保留）"),
-            "keyword_blacklist": ConfigField(type=list, default=[], description="关键词黑名单"),
+            "min_like_count": ConfigField(
+                type=int, default=100,
+                description="最小点赞数",
+                label="最小点赞数",
+                hint="低于此值的内容会被过滤，设为 0 则不过滤",
+                min=0, max=100000, step=10,
+                order=0,
+            ),
+            "keyword_whitelist": ConfigField(
+                type=list, default=[],
+                description="关键词白名单",
+                label="白名单关键词",
+                hint="包含这些关键词的内容会优先保留，即使点赞数不够",
+                placeholder="教程, 攻略, 科普",
+                order=1,
+            ),
+            "keyword_blacklist": ConfigField(
+                type=list, default=[],
+                description="关键词黑名单",
+                label="黑名单关键词",
+                hint="包含这些关键词的内容会被直接过滤",
+                placeholder="广告, 推广, 代购",
+                order=2,
+            ),
         },
         "processing": {
-            "enable_summary": ConfigField(type=bool, default=True, description="启用LLM摘要"),
-            "summary_threshold": ConfigField(type=int, default=200, description="摘要触发长度"),
-            "enable_image_recognition": ConfigField(type=bool, default=False, description="启用图片识别"),
-            "image_recognition_timeout": ConfigField(type=int, default=30, description="识图超时(秒)"),
+            "enable_personality_match": ConfigField(
+                type=bool, default=True,
+                description="启用人格兴趣匹配",
+                label="人格兴趣匹配",
+                hint="使用 LLM 判断内容是否符合 MaiBot 的兴趣，只学习感兴趣的内容",
+                order=0,
+            ),
+            "enable_summary": ConfigField(
+                type=bool, default=True,
+                description="启用 LLM 摘要",
+                label="LLM 摘要生成",
+                hint="对长文本生成摘要",
+                order=1,
+            ),
+            "summary_threshold": ConfigField(
+                type=int, default=200,
+                description="摘要触发长度",
+                label="摘要触发长度（字符）",
+                hint="超过此长度的内容才会生成摘要",
+                min=50, max=2000, step=50,
+                depends_on="processing.enable_summary",
+                depends_value=True,
+                order=2,
+            ),
+            "enable_image_recognition": ConfigField(
+                type=bool, default=False,
+                description="启用图片识别",
+                label="图片识别（VLM）",
+                hint="使用视觉模型理解图片内容，会增加处理时间和 API 调用",
+                order=3,
+            ),
+            "image_recognition_timeout": ConfigField(
+                type=int, default=30,
+                description="识图超时时间",
+                label="识图超时（秒）",
+                min=10, max=120, step=5,
+                depends_on="processing.enable_image_recognition",
+                depends_value=True,
+                order=4,
+            ),
         },
         "memory": {
-            "max_records": ConfigField(type=int, default=1000, description="最大记录数"),
-            "auto_cleanup_days": ConfigField(type=int, default=30, description="自动清理天数"),
+            "max_records": ConfigField(
+                type=int, default=1000,
+                description="最大记录数",
+                label="每平台最大记录数",
+                hint="超过此数量会自动删除最旧的记录",
+                min=100, max=10000, step=100,
+                order=0,
+            ),
+            "auto_cleanup_days": ConfigField(
+                type=int, default=30,
+                description="自动清理天数",
+                label="记忆保留天数",
+                hint="超过此天数的记录会被自动清理",
+                min=7, max=365, step=1,
+                order=1,
+            ),
         },
         "scheduler": {
-            "enabled": ConfigField(type=bool, default=False, description="启用定时采集"),
-            "interval_minutes": ConfigField(type=int, default=60, description="采集间隔(分钟)"),
-            "first_delay_minutes": ConfigField(type=int, default=5, description="首次延迟(分钟)"),
+            "enabled": ConfigField(
+                type=bool, default=False,
+                description="启用定时采集",
+                label="启用定时采集",
+                hint="建议先手动测试成功后再开启",
+                order=0,
+            ),
+            "interval_minutes": ConfigField(
+                type=int, default=60,
+                description="采集间隔",
+                label="采集间隔（分钟）",
+                hint="建议不要设置太短，避免频繁请求",
+                min=10, max=1440, step=10,
+                depends_on="scheduler.enabled",
+                depends_value=True,
+                order=1,
+            ),
+            "first_delay_minutes": ConfigField(
+                type=int, default=5,
+                description="首次延迟",
+                label="首次采集延迟（分钟）",
+                hint="插件启动后等待多久开始第一次采集",
+                min=1, max=60, step=1,
+                depends_on="scheduler.enabled",
+                depends_value=True,
+                order=2,
+            ),
+        },
+        "dream": {
+            "enabled": ConfigField(
+                type=bool, default=True,
+                description="启用做梦模块集成",
+                label="做梦模块集成",
+                hint="开启后做梦 agent 可以调用 SNS 采集工具主动学习",
+                order=0,
+            ),
+        },
+        "debug": {
+            "enabled": ConfigField(
+                type=bool, default=False,
+                description="启用调试模式",
+                label="调试日志",
+                hint="开启后会输出详细的采集过程日志",
+                order=0,
+            ),
         },
     }
     
