@@ -19,15 +19,31 @@
 
 ### 2. 小红书 MCP Server
 
-需要安装并运行小红书 MCP Server：
+从 [GitHub Releases](https://github.com/xpzouying/xiaohongshu-mcp/releases) 下载对应平台的二进制文件：
+
+**主程序（MCP 服务）：**
+- macOS Apple Silicon: `xiaohongshu-mcp-darwin-arm64`
+- macOS Intel: `xiaohongshu-mcp-darwin-amd64`
+- Windows x64: `xiaohongshu-mcp-windows-amd64.exe`
+- Linux x64: `xiaohongshu-mcp-linux-amd64`
+
+**登录工具：**
+- macOS Apple Silicon: `xiaohongshu-login-darwin-arm64`
+- macOS Intel: `xiaohongshu-login-darwin-amd64`
+- Windows x64: `xiaohongshu-login-windows-amd64.exe`
+- Linux x64: `xiaohongshu-login-linux-amd64`
+
+**使用步骤：**
 
 ```bash
-# 使用 npx 运行（推荐）
-npx -y @anthropic/mcp-xiaohongshu
+# 1. 首先运行登录工具（扫码登录小红书）
+#如果你运行在纯命令行环境，需要在有头环境进行扫码登录后获取到cookies.json放在此mcp的文件夹内
+chmod +x xiaohongshu-login-linux-amd64
+./xiaohongshu-login-linux-amd64
 
-# 或者全局安装
-npm install -g @anthropic/mcp-xiaohongshu
-mcp-xiaohongshu
+# 2. 然后启动 MCP 服务
+chmod +x xiaohongshu-mcp-linux-amd64
+./xiaohongshu-mcp-linux-amd64
 ```
 
 默认运行在 `http://localhost:3000`
@@ -54,13 +70,20 @@ url = "http://localhost:3000"
 enabled = true
 description = "小红书 MCP 服务"
 
-# 禁用这些工具在 LLM 回复时被调用（只供 SNS 插件内部使用）
-disabled_tools = [
-    "mcp_xiaohongshu_list_feeds",
-    "mcp_xiaohongshu_search_feeds",
-    "mcp_xiaohongshu_get_feed_detail",
-    "mcp_xiaohongshu_check_login_status",
-]
+# 禁用这些工具，以禁止 LLM 回复时被调用（只供 SNS 插件内部使用）
+disabled_tools = """mcp_xiaohongshu_check_login_status
+mcp_xiaohongshu_delete_cookies
+mcp_xiaohongshu_favorite_feed
+mcp_xiaohongshu_get_feed_detail
+mcp_xiaohongshu_get_login_qrcode
+mcp_xiaohongshu_like_feed
+mcp_xiaohongshu_list_feeds
+mcp_xiaohongshu_post_comment_to_feed
+mcp_xiaohongshu_publish_content
+mcp_xiaohongshu_publish_with_video
+mcp_xiaohongshu_reply_comment_in_feed
+mcp_xiaohongshu_search_feeds
+mcp_xiaohongshu_user_profile"""
 ```
 
 ### 2. 配置 SNS 插件
@@ -162,8 +185,4 @@ enabled = true                        # 调试日志
 1. 小红书 MCP Server 需要登录才能获取完整内容，请按照其文档完成登录
 2. 图片识别需要配置 VLM 模型（在 MaiBot 的 model_config.toml 中）
 3. 建议先手动测试成功后再开启定时任务
-4. `config.toml` 包含用户配置，不会被 git 跟踪
 
-## License
-
-MIT
