@@ -1,0 +1,58 @@
+{
+  "manifest_version": 1,
+  "name": "MaiBot_SNS - 社交平台采集插件",
+  "version": "1.0.0",
+  "description": "通过MCP桥接插件与MaiBot的做梦模块集成采集社交平台内容（如小红书），写入ChatHistory记忆系统，以供日后对话时调取使用（需开启全局ChatHistory）的MaiBot插件",
+  "author": {
+    "name": "CharTyr",
+    "url": "https://github.com/CharTyr"
+  },
+  "license": "GPL-v3.0-or-later",
+  "host_application": {
+    "min_version": "0.11.0"
+  },
+  "keywords": [
+    "sns",
+    "xiaohongshu",
+    "social",
+    "memory",
+    "dream"
+  ],
+  "categories": [
+    "Data",
+    "Memory"
+  ],
+  "default_locale": "zh-CN",
+  "plugin_info": {
+    "is_built_in": false,
+    "plugin_type": "data",
+    "components": [
+      {
+        "type": "tool",
+        "name": "collect_sns_content",
+        "description": "从社交平台采集热门内容并写入记忆"
+      },
+      {
+        "type": "tool",
+        "name": "cleanup_sns_memory",
+        "description": "清理过期的社交平台记忆"
+      },
+      {
+        "type": "command",
+        "name": "sns_command",
+        "description": "社交平台采集命令",
+        "pattern": "/sns [collect|search|status|cleanup|config]"
+      }
+    ],
+    "features": [
+      "通过MCP桥接调用小红书等社交平台API",
+      "智能过滤低质量内容（点赞数、黑白名单）",
+      "LLM摘要生成和关键词提取",
+      "写入ChatHistory与对话记忆统一管理",
+      "与做梦模块集成",
+      "定时任务自动采集",
+      "手动命令触发采集"
+    ]
+  },
+  "id": "MaiBot.MaiBot_SNS"
+}
