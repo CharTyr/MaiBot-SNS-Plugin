@@ -151,6 +151,41 @@ enabled = true                        # 调试日志
 
 采集的内容会写入 ChatHistory，MaiBot 在回忆时可以通过 `search_sns_memory` 工具搜索这些记忆。
 
+## 关于全局记忆
+
+**重要：本插件不需要开启主程序的全局记忆功能即可正常工作。**
+
+MaiBot 主程序的 `global_memory` 配置是一个需要谨慎开启的功能，它会让 MaiBot 在所有群聊中共享记忆。但 SNS 插件采用了独立的记忆检索机制，不依赖此配置。
+
+### 实现原理
+
+1. **独立的检索工具**：SNS 插件注册了专用的 `search_sns_memory` 工具到记忆检索系统
+2. **独立的数据标识**：所有 SNS 记忆使用 `sns_{platform}` 格式的 `chat_id`（如 `sns_xiaohongshu`）
+3. **直接数据库查询**：`search_sns_memory` 直接查询 `chat_id` 以 `sns_` 开头的记录，不经过全局记忆逻辑
+
+### 工作流程
+
+```
+回忆系统触发
+    ↓
+调用所有注册的检索工具（包括 search_sns_memory）
+    ↓
+search_sns_memory 直接查询 sns_* 记录
+    ↓
+返回相关的 SNS 记忆
+```
+
+### 与全局记忆的区别
+
+| 功能 | 全局记忆 (search_chat_history) | SNS 记忆 (search_sns_memory) |
+|------|-------------------------------|------------------------------|
+| 配置依赖 | 需要开启 `global_memory` | 无需任何主程序配置 |
+| 数据范围 | 所有群聊的聊天记录 | 仅 SNS 采集的内容 |
+| chat_id | 群号/用户ID | `sns_{platform}` |
+| 隐私风险 | 可能跨群泄露信息 | 无跨群风险 |
+
+因此，你可以放心使用 SNS 插件而无需担心全局记忆带来的隐私问题。
+
 ## 工作流程
 
 ```
