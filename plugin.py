@@ -46,7 +46,7 @@ _collector_stats: Dict[str, Any] = {
     "recent_memories": [],  # 最近写入的记忆
 }
 
-# feed_id 缓存（避免重复查询数据库）
+# feed_id 缓存（避免重复查询数据库），存储格式: "{platform}:{feed_id}"
 _feed_id_cache: set = set()
 _feed_id_cache_loaded: bool = False
 
@@ -377,6 +377,42 @@ class SNSCollector:
         return self._adapters[platform]
     
     @staticmethod
+    def _make_cache_key(platform: str, feed_id: str) -> str:
+        return f"{platform}:{feed_id}"
+
+    @staticmethod
+    def _extract_feed_id_from_key_point(key_point: Any) -> Optional[str]:
+        """从 ChatHistory.key_point 中提取 feed_id（兼容 JSON list / 纯文本）"""
+        if not key_point:
+            return None
+
+        if isinstance(key_point, list):
+            for item in key_point:
+                if isinstance(item, str) and item.startswith("feed_id:"):
+                    value = item.split("feed_id:", 1)[1].strip()
+                    return value or None
+            return None
+
+        if not isinstance(key_point, str):
+            key_point = str(key_point)
+
+        text = key_point.strip()
+        if not text:
+            return None
+
+        if text.startswith("["):
+            try:
+                parsed = json.loads(text)
+                if isinstance(parsed, list):
+                    return SNSCollector._extract_feed_id_from_key_point(parsed)
+            except Exception:
+                pass
+
+        import re
+        match = re.search(r"feed_id:([A-Za-z0-9_-]+)", text)
+        return match.group(1) if match else None
+
+    @staticmethod
     def _load_feed_id_cache() -> None:
         """加载 feed_id 缓存"""
         global _feed_id_cache, _feed_id_cache_loaded
@@ -397,32 +433,39 @@ class SNSCollector:
         except Exception as e:
             logger.warning(f"加载 feed_id 缓存失败: {e}")
     
-    @staticmethod
-    async def _async_load_feed_id_cache() -> None:
-        """异步加载 feed_id 缓存"""
+    async def _async_load_feed_id_cache(self) -> None:
+        """异步加载 feed_id 缓存（按平台加载，避免全表扫描导致缓存缺失）"""
         global _feed_id_cache, _feed_id_cache_loaded
-        if _feed_id_cache and len(_feed_id_cache) > 0:
+        if _feed_id_cache_loaded:
             return
         
         try:
-            records = await database_api.db_get(
-                ChatHistory,
-                filters={},
-                limit=2000,
-            )
-            
-            if records:
-                for r in records:
-                    chat_id = r.get("chat_id", "")
-                    if not str(chat_id).startswith("sns_"):
-                        continue
-                    key_point = r.get("key_point", "") or ""
-                    # 从 key_point 中提取 feed_id
-                    if "feed_id:" in key_point:
-                        import re
-                        match = re.search(r'feed_id:([a-zA-Z0-9]+)', key_point)
-                        if match:
-                            _feed_id_cache.add(match.group(1))
+            max_records = int(self.memory_cfg.get("max_records", 1000) or 1000)
+            max_records = max(max_records, 0)
+
+            platforms: List[str] = []
+            for platform, cfg in (self.platform_cfg or {}).items():
+                if isinstance(cfg, dict) and cfg.get("enabled", True):
+                    platforms.append(platform)
+            if not platforms:
+                platforms = ["xiaohongshu"]
+
+            for platform in platforms:
+                try:
+                    records = await database_api.db_get(
+                        ChatHistory,
+                        filters={"chat_id": f"sns_{platform}"},
+                        order_by="-start_time",
+                        limit=max_records + 300,
+                    )
+                except Exception as e:
+                    logger.debug(f"[SNS] 加载 feed_id 缓存失败 platform={platform}: {e}")
+                    continue
+
+                for r in (records or []):
+                    feed_id = SNSCollector._extract_feed_id_from_key_point(r.get("key_point", ""))
+                    if feed_id:
+                        _feed_id_cache.add(SNSCollector._make_cache_key(platform, feed_id))
             
             logger.info(f"[SNS] 加载 feed_id 缓存: {len(_feed_id_cache)} 条")
             _feed_id_cache_loaded = True
@@ -486,6 +529,20 @@ class SNSCollector:
         global _collector_stats
         
         result = CollectResult(success=False)
+
+        platform = (platform or "").strip() or "xiaohongshu"
+        keyword = keyword.strip() if isinstance(keyword, str) else keyword
+        if keyword == "":
+            keyword = None
+        count = max(int(count or 0), 0)
+        if count == 0:
+            result.errors.append("采集数量必须大于 0")
+            return result
+
+        platform_config = self.platform_cfg.get(platform, {})
+        if platform_config and not platform_config.get("enabled", True):
+            result.errors.append(f"平台未启用: {platform}")
+            return result
         
         # 检查是否正在运行
         if _collector_stats["is_running"]:
@@ -562,7 +619,7 @@ class SNSCollector:
                 return result
             
             # 4. 获取详情（只对感兴趣的内容获取完整正文）
-            fetch_detail = self.platform.get(platform, {}).get("fetch_detail", True)
+            fetch_detail = platform_config.get("fetch_detail", True)
             if fetch_detail:
                 if self.debug:
                     logger.info("-" * 60)
@@ -605,7 +662,7 @@ class SNSCollector:
                         await self._write_to_memory(content, platform)
                         result.written += 1
                         # 添加到缓存
-                        _feed_id_cache.add(content.feed_id)
+                        _feed_id_cache.add(self._make_cache_key(platform, content.feed_id))
                         # 记录最近写入的记忆
                         _collector_stats["recent_memories"].append({
                             "title": content.title[:50],
@@ -623,6 +680,16 @@ class SNSCollector:
                     result.errors.append(f"写入失败: {e}")
             
             result.success = True
+
+            # 自动清理（仅在写入模式执行）
+            if not preview_only:
+                auto_days = int(self.memory_cfg.get("auto_cleanup_days", 0) or 0)
+                max_records = int(self.memory_cfg.get("max_records", 0) or 0)
+                if auto_days > 0 or max_records > 0:
+                    await self.cleanup(
+                        days=auto_days if auto_days > 0 else 36500,
+                        max_records=max_records if max_records > 0 else 1000,
+                    )
             
             # 更新统计
             _collector_stats["last_collect_time"] = time.time()
@@ -650,7 +717,7 @@ class SNSCollector:
         """使用缓存检查是否重复（快速）"""
         if not content.feed_id:
             return False
-        return content.feed_id in _feed_id_cache
+        return self._make_cache_key(content.platform, content.feed_id) in _feed_id_cache
     
     async def _fetch_contents(self, platform: str, keyword: Optional[str], count: int) -> List[SNSContent]:
         """通过MCP工具获取内容（使用平台适配器）"""
@@ -1085,8 +1152,15 @@ class SNSCollector:
         """生成摘要"""
         text = f"{content.title}\n{content.content}"
         
-        if len(text) < 200:
+        threshold = int(self.processing_cfg.get("summary_threshold", 200) or 200)
+        enable_summary = bool(self.processing_cfg.get("enable_summary", True))
+        max_len = 200
+
+        if len(text) <= threshold:
             return text
+
+        if not enable_summary:
+            return (text[:max_len] + "...") if len(text) > max_len else text
         
         # 使用LLM生成摘要
         try:
@@ -1094,19 +1168,22 @@ class SNSCollector:
             model_cfg = models.get("utils") or models.get("replyer")
             
             if model_cfg:
-                prompt = f"请用一两句话概括以下内容的核心信息：\n\n{text[:1000]}"
+                prompt = (
+                    "请用一两句话概括以下内容的核心信息，避免无关寒暄，不要超过 120 字：\n\n"
+                    f"{text[:1500]}"
+                )
                 success, summary, _, _ = await llm_api.generate_with_model(
                     prompt=prompt,
                     model_config=model_cfg,
                     request_type="sns_summary",
                 )
                 if success and summary:
-                    return summary.strip()
+                    return summary.strip()[:200]
         except Exception as e:
             logger.warning(f"LLM摘要失败: {e}")
         
         # 降级：截断
-        return text[:200] + "..."
+        return (text[:max_len] + "...") if len(text) > max_len else text
     
     async def _extract_keywords(self, content: SNSContent) -> List[str]:
         """提取关键词"""
@@ -1135,49 +1212,67 @@ class SNSCollector:
         
         return unique[:8]
     
-    async def cleanup(self, days: int = 30, max_records: int = 1000) -> Tuple[int, int]:
-        """清理旧记忆"""
+    async def cleanup(self, days: int = 30, max_records: Optional[int] = None) -> Tuple[int, int]:
+        """清理旧记忆（按平台分别清理，避免不同平台互相挤占配额）"""
         deleted = 0
         checked = 0
-        
-        # 获取SNS记忆
-        records = await database_api.db_get(
-            ChatHistory,
-            filters={},
-            order_by="-start_time",
-            limit=max_records + 100,
+
+        max_records = int(
+            max_records
+            if max_records is not None
+            else (self.memory_cfg.get("max_records", 1000) or 1000)
         )
-        
-        if not records:
-            return checked, deleted
-        
-        # 筛选SNS记忆
-        sns_records = [r for r in records if str(r.get("chat_id", "")).startswith("sns_")]
-        checked = len(sns_records)
-        
-        # 按时间清理
-        cutoff = time.time() - days * 86400
-        for r in sns_records:
-            if r.get("start_time", 0) < cutoff:
+        max_records = max(max_records, 0)
+
+        platforms: List[str] = []
+        for platform, cfg in (self.platform_cfg or {}).items():
+            if isinstance(cfg, dict) and cfg.get("enabled", True):
+                platforms.append(platform)
+        if not platforms:
+            platforms = ["xiaohongshu"]
+
+        cutoff = time.time() - int(days) * 86400
+
+        for platform in platforms:
+            chat_id = f"sns_{platform}"
+            try:
+                records = await database_api.db_get(
+                    ChatHistory,
+                    filters={"chat_id": chat_id},
+                    order_by="-start_time",
+                    limit=max_records + 500,
+                )
+            except Exception as e:
+                logger.warning(f"SNS记忆清理查询失败 platform={platform}: {e}")
+                continue
+
+            if not records:
+                continue
+
+            checked += len(records)
+
+            ids_to_delete = set()
+
+            # 按时间清理
+            for r in records:
+                if r.get("start_time", 0) < cutoff:
+                    if r.get("id") is not None:
+                        ids_to_delete.add(r["id"])
+
+            # 按数量清理（每平台保留最新 max_records 条）
+            if max_records > 0 and len(records) > max_records:
+                for r in records[max_records:]:
+                    if r.get("id") is not None:
+                        ids_to_delete.add(r["id"])
+
+            for record_id in ids_to_delete:
                 await database_api.db_query(
                     ChatHistory,
                     query_type="delete",
-                    filters={"id": r["id"]},
+                    filters={"id": record_id},
                 )
                 deleted += 1
-        
-        # 按数量清理
-        if len(sns_records) - deleted > max_records:
-            to_delete = sns_records[max_records:]
-            for r in to_delete:
-                if r["id"] not in [x["id"] for x in sns_records[:max_records]]:
-                    await database_api.db_query(
-                        ChatHistory,
-                        query_type="delete",
-                        filters={"id": r["id"]},
-                    )
-                    deleted += 1
-        
+
         logger.info(f"SNS记忆清理: 检查{checked}条, 删除{deleted}条")
         return checked, deleted
 
@@ -1247,6 +1342,7 @@ class SNSStatusTool(BaseTool):
     
     async def execute(self, function_args: dict) -> dict:
         action = function_args.get("action", "stats")
+        config = _get_config()
         
         if action == "stats":
             # 返回统计信息
@@ -1255,15 +1351,29 @@ class SNSStatusTool(BaseTool):
             
             # 获取数据库中的记忆数量
             try:
-                records = await database_api.db_get(ChatHistory, limit=2000)
-                sns_records = [r for r in (records or []) if str(r.get("chat_id", "")).startswith("sns_")]
-                stats["total_memories"] = len(sns_records)
-                
-                # 按平台统计
-                by_platform = {}
-                for r in sns_records:
-                    p = r.get("chat_id", "").replace("sns_", "")
-                    by_platform[p] = by_platform.get(p, 0) + 1
+                platform_cfg = config.get("platform", {}) if isinstance(config, dict) else {}
+                platforms = [
+                    p for p, cfg in platform_cfg.items()
+                    if isinstance(cfg, dict) and cfg.get("enabled", True)
+                ]
+                if not platforms:
+                    platforms = [p for p in platform_cfg.keys()] or ["xiaohongshu"]
+
+                max_records = int(config.get("memory", {}).get("max_records", 1000) or 1000) if isinstance(config, dict) else 1000
+                max_records = max(max_records, 0)
+
+                by_platform: Dict[str, int] = {}
+                total = 0
+                for p in platforms:
+                    records = await database_api.db_get(
+                        ChatHistory,
+                        filters={"chat_id": f"sns_{p}"},
+                        limit=max_records + 500,
+                    )
+                    count = len(records or [])
+                    by_platform[p] = count
+                    total += count
+                stats["total_memories"] = total
                 stats["by_platform"] = by_platform
             except Exception:
                 stats["total_memories"] = 0
@@ -1274,26 +1384,33 @@ class SNSStatusTool(BaseTool):
         elif action == "memories":
             # 返回最近的记忆列表
             try:
-                records = await database_api.db_get(
-                    ChatHistory,
-                    filters={},
-                    order_by="-start_time",
-                    limit=50,
-                )
-                
-                sns_records = []
-                for r in (records or []):
-                    if not str(r.get("chat_id", "")).startswith("sns_"):
-                        continue
-                    sns_records.append({
-                        "id": r.get("id"),
-                        "platform": r.get("chat_id", "").replace("sns_", ""),
-                        "theme": r.get("theme", ""),
-                        "summary": r.get("summary", "")[:200],
-                        "time": r.get("start_time", 0),
-                    })
-                
-                return {"name": self.name, "content": json.dumps(sns_records[:20], ensure_ascii=False)}
+                platform_cfg = config.get("platform", {}) if isinstance(config, dict) else {}
+                platforms = [
+                    p for p, cfg in platform_cfg.items()
+                    if isinstance(cfg, dict) and cfg.get("enabled", True)
+                ]
+                if not platforms:
+                    platforms = [p for p in platform_cfg.keys()] or ["xiaohongshu"]
+
+                merged: List[Dict[str, Any]] = []
+                for p in platforms:
+                    records = await database_api.db_get(
+                        ChatHistory,
+                        filters={"chat_id": f"sns_{p}"},
+                        order_by="-start_time",
+                        limit=20,
+                    )
+                    for r in (records or []):
+                        merged.append({
+                            "id": r.get("id"),
+                            "platform": p,
+                            "theme": r.get("theme", ""),
+                            "summary": (r.get("summary", "") or "")[:200],
+                            "time": r.get("start_time", 0),
+                        })
+
+                merged.sort(key=lambda x: x.get("time", 0), reverse=True)
+                return {"name": self.name, "content": json.dumps(merged[:20], ensure_ascii=False)}
             except Exception as e:
                 return {"name": self.name, "content": json.dumps({"error": str(e)})}
         
@@ -1382,8 +1499,10 @@ class SNSCommand(BaseCommand):
             # 模拟做梦式采集：带人格兴趣匹配的采集
             await self.send_text("🌙 开始做梦式采集（带人格兴趣匹配）...")
             
-            # 强制开启人格匹配
-            dream_config = dict(config)
+            # 强制开启人格匹配（避免修改原配置对象）
+            import copy
+
+            dream_config = copy.deepcopy(config)
             if "processing" not in dream_config:
                 dream_config["processing"] = {}
             dream_config["processing"]["enable_personality_match"] = True
@@ -1547,8 +1666,9 @@ def _register_dream_tools() -> None:
         # 创建 SNS 采集工具的执行函数
         async def collect_sns_content(platform: str = "xiaohongshu", keyword: str = "", count: int = 10) -> str:
             """执行 SNS 采集"""
-            config = _get_config()
-            # 强制开启人格匹配
+            import copy
+
+            config = copy.deepcopy(_get_config())
             if "processing" not in config:
                 config["processing"] = {}
             config["processing"]["enable_personality_match"] = True
@@ -1596,14 +1716,31 @@ def _register_memory_retrieval_tools() -> None:
                 return "请提供搜索关键词"
             
             try:
-                # 直接查询数据库中的 SNS 记录
-                records = await database_api.db_get(
-                    ChatHistory,
-                    filters={},
-                    order_by="-start_time",
-                    limit=100,
-                )
-                
+                config = _get_config()
+                platform_cfg = config.get("platform", {}) if isinstance(config, dict) else {}
+                platforms = [
+                    p for p, cfg in platform_cfg.items()
+                    if isinstance(cfg, dict) and cfg.get("enabled", True)
+                ]
+                if not platforms:
+                    platforms = [p for p in platform_cfg.keys()] or ["xiaohongshu"]
+
+                max_records = int(config.get("memory", {}).get("max_records", 1000) or 1000) if isinstance(config, dict) else 1000
+                max_records = max(max_records, 0)
+
+                records: List[Dict[str, Any]] = []
+                for p in platforms:
+                    chunk = await database_api.db_get(
+                        ChatHistory,
+                        filters={"chat_id": f"sns_{p}"},
+                        order_by="-start_time",
+                        limit=min(max_records, 1000) + 200,
+                    )
+                    for r in (chunk or []):
+                        r = dict(r)
+                        r["_sns_platform"] = p
+                        records.append(r)
+
                 if not records:
                     return "未找到任何 SNS 记忆"
                 
@@ -1612,10 +1749,6 @@ def _register_memory_retrieval_tools() -> None:
                 matched = []
                 
                 for r in records:
-                    # 只搜索 SNS 记录
-                    if not str(r.get("chat_id", "")).startswith("sns_"):
-                        continue
-                    
                     # 在 theme、summary、keywords 中搜索
                     theme = (r.get("theme") or "").lower()
                     summary = (r.get("summary") or "").lower()
@@ -1633,7 +1766,7 @@ def _register_memory_retrieval_tools() -> None:
                 # 构建结果
                 results = []
                 for r in matched[:10]:  # 最多返回10条
-                    platform = r.get("chat_id", "").replace("sns_", "")
+                    platform = r.get("_sns_platform") or r.get("chat_id", "").replace("sns_", "")
                     results.append(
                         f"记忆ID：{r.get('id')}\n"
                         f"来源：{platform}\n"
@@ -1654,16 +1787,19 @@ def _register_memory_retrieval_tools() -> None:
                 id_list = [int(id_str.strip()) for id_str in memory_ids.split(",") if id_str.strip().isdigit()]
                 if not id_list:
                     return "请提供有效的记忆ID"
-                
-                # 查询记录（不限制 chat_id，支持跨聊天流获取 SNS 记忆）
-                records = await database_api.db_get(
-                    ChatHistory,
-                    filters={},
-                    limit=500,
-                )
-                
-                # 筛选匹配的记录
-                matched = [r for r in (records or []) if r.get("id") in id_list]
+
+                matched: List[Dict[str, Any]] = []
+                for record_id in id_list:
+                    try:
+                        records = await database_api.db_get(
+                            ChatHistory,
+                            filters={"id": record_id},
+                            limit=1,
+                        )
+                        if records:
+                            matched.append(records[0])
+                    except Exception:
+                        continue
                 
                 if not matched:
                     return f"未找到ID为 {id_list} 的记忆"
@@ -1682,7 +1818,7 @@ def _register_memory_retrieval_tools() -> None:
                         parts.append(f"关键词：{r.get('keywords')}")
                     results.append("\n".join(parts))
                 
-                return "\n\n" + "=" * 50 + "\n\n".join(results)
+                return "\n\n" + ("=" * 50) + "\n\n" + "\n\n".join(results)
                 
             except Exception as e:
                 logger.error(f"获取 SNS 记忆详情失败: {e}")

@@ -23,9 +23,7 @@ MaiBot_SNS/
 ├── config.toml            # 运行时配置
 ├── config.example.toml    # 配置模板
 ├── README.md              # 用户文档
-├── Agent.md               # 本文档（开发文档）
-├── processors/
-│   └── content_processor.py  # 内容处理器（备用，主逻辑在 plugin.py）
+├── AGENT.md               # 本文档（开发文档）
 └── tests/
     └── test_plugin.py     # 单元测试
 ```

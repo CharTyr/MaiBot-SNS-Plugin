@@ -3,12 +3,21 @@ MaiBot_SNS 插件单元测试
 """
 
 import pytest
-import asyncio
-from unittest.mock import Mock, AsyncMock, patch
+from unittest.mock import AsyncMock, patch
 import json
 
 # 测试数据模型
-from ..plugin import SNSContent, CollectResult, SNSCollector
+from .. import plugin as plugin_module
+from ..plugin import SNSContent, CollectResult, SNSCollector, XiaohongshuAdapter
+
+
+@pytest.fixture(autouse=True)
+def _reset_plugin_globals():
+    plugin_module._feed_id_cache.clear()
+    plugin_module._collector_stats["is_running"] = False
+    plugin_module._collector_stats["recent_memories"] = []
+    yield
+    plugin_module._feed_id_cache.clear()
 
 
 class TestSNSContent:
@@ -112,36 +121,41 @@ class TestSNSCollector:
         assert filtered[0].feed_id == "1"
     
     def test_parse_mcp_result_json_list(self, collector):
-        """测试解析JSON列表格式"""
+        """测试解析JSON列表格式（适配器解析）"""
         result = json.dumps([
-            {"id": "123", "title": "标题", "desc": "内容", "nickname": "作者", "liked_count": 100},
+            {"id": "123", "title": "标题", "desc": "内容", "nickname": "作者", "likedCount": 100},
         ])
-        contents = collector._parse_mcp_result(result, "xiaohongshu")
+        adapter = collector._get_adapter("xiaohongshu")
+        contents = adapter.parse_list_result(result)
         assert len(contents) == 1
         assert contents[0].feed_id == "123"
         assert contents[0].title == "标题"
     
     def test_parse_mcp_result_json_object(self, collector):
-        """测试解析JSON对象格式"""
+        """测试解析JSON对象格式（items 列表）"""
         result = json.dumps({
             "items": [
-                {"id": "456", "title": "标题2", "desc": "内容2", "nickname": "作者2", "liked_count": 200},
+                {"id": "456", "title": "标题2", "desc": "内容2", "nickname": "作者2", "likedCount": 200},
             ]
         })
-        contents = collector._parse_mcp_result(result, "xiaohongshu")
+        adapter = collector._get_adapter("xiaohongshu")
+        contents = adapter.parse_list_result(result)
         assert len(contents) == 1
         assert contents[0].feed_id == "456"
     
     def test_parse_mcp_result_invalid_json(self, collector):
-        """测试解析无效JSON"""
+        """测试解析无效JSON（适配器容错）"""
         result = "这不是JSON"
-        contents = collector._parse_mcp_result(result, "xiaohongshu")
+        adapter = collector._get_adapter("xiaohongshu")
+        contents = adapter.parse_list_result(result)
         assert len(contents) == 0
     
     def test_get_content_url(self, collector):
         """测试获取内容URL"""
         content = SNSContent("abc123", "xiaohongshu", "", "", "")
-        url = collector._get_content_url(content)
+        adapter = collector._get_adapter("xiaohongshu")
+        assert isinstance(adapter, XiaohongshuAdapter)
+        url = adapter.get_content_url(content)
         assert url == "https://xiaohongshu.com/explore/abc123"
     
     @pytest.mark.asyncio
@@ -157,8 +171,13 @@ class TestSNSCollector:
         """测试关键词提取"""
         content = SNSContent("1", "xhs", "Python 教程 入门", "内容", "作者")
         keywords = await collector._extract_keywords(content)
-        assert len(keywords) <= 5
+        assert len(keywords) <= 8
         assert "Python" in keywords
+
+    def test_extract_feed_id_from_key_point(self, collector):
+        """测试从 key_point 提取 feed_id（兼容 JSON 字符串）"""
+        key_point = json.dumps(["feed_id:abc_123", "likes:10"], ensure_ascii=False)
+        assert collector._extract_feed_id_from_key_point(key_point) == "abc_123"
 
 
 class TestCollectorIntegration:
@@ -179,14 +198,14 @@ class TestCollectorIntegration:
         mock_tool = AsyncMock()
         mock_tool.direct_execute.return_value = {
             "content": json.dumps([
-                {"id": "1", "title": "测试", "desc": "内容", "nickname": "作者", "liked_count": 100}
+                {"id": "1", "title": "测试", "desc": "内容", "nickname": "作者", "likedCount": 100}
             ])
         }
         
-        with patch("MaiBot.plugins.MaiBot_SNS.plugin.tool_api") as mock_api:
+        with patch("plugins.MaiBot_SNS.plugin.tool_api") as mock_api:
             mock_api.get_tool_instance.return_value = mock_tool
             
-            with patch("MaiBot.plugins.MaiBot_SNS.plugin.database_api") as mock_db:
+            with patch("plugins.MaiBot_SNS.plugin.database_api") as mock_db:
                 mock_db.db_get = AsyncMock(return_value=[])
                 mock_db.db_query = AsyncMock(return_value=None)
                 
