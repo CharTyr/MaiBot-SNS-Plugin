@@ -14,10 +14,12 @@ from ..plugin import SNSContent, CollectResult, SNSCollector, XiaohongshuAdapter
 @pytest.fixture(autouse=True)
 def _reset_plugin_globals():
     plugin_module._feed_id_cache.clear()
+    plugin_module._feed_id_cache_loaded = False
     plugin_module._collector_stats["is_running"] = False
     plugin_module._collector_stats["recent_memories"] = []
     yield
     plugin_module._feed_id_cache.clear()
+    plugin_module._feed_id_cache_loaded = False
 
 
 class TestSNSContent:

@@ -5,10 +5,13 @@ MaiBot_SNS - 社交平台信息采集与记忆写入插件
 支持做梦模块集成、定时任务和手动命令触发。
 """
 
+from __future__ import annotations
+
 import asyncio
 import json
+import os
 import time
-from dataclasses import dataclass, field
+from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import List, Tuple, Type, Optional, Dict, Any
 
@@ -25,14 +28,89 @@ from src.plugin_system import (
 from src.plugin_system.base.config_types import ConfigSection
 from src.plugin_system.base.base_events_handler import BaseEventHandler
 from src.plugin_system.base.component_types import EventType
+from src.plugin_system.base.component_types import PythonDependency
 from src.plugin_system.apis import tool_api, llm_api, database_api
 from src.common.database.database_model import ChatHistory
 
 logger = get_logger("maibot_sns")
 
-# 缓存文件路径
-CACHE_FILE = Path(__file__).parent / "failed_writes.json"
-STATE_FILE = Path(__file__).parent / "collector_state.json"
+def _get_data_dir() -> Path:
+    """获取插件运行时可写目录（默认 data/maibot_sns，可用环境变量覆盖）。"""
+    env_dir = os.getenv("MAIBOT_SNS_DATA_DIR", "").strip()
+    if env_dir:
+        return Path(env_dir)
+    return Path("data") / "maibot_sns"
+
+
+def _ensure_data_dir() -> Path:
+    data_dir = _get_data_dir()
+    try:
+        data_dir.mkdir(parents=True, exist_ok=True)
+    except Exception:
+        pass
+    return data_dir
+
+
+# 运行时文件路径（严禁写入插件目录）
+DATA_DIR = _ensure_data_dir()
+CACHE_FILE = DATA_DIR / "failed_writes.json"
+STATE_FILE = DATA_DIR / "collector_state.json"
+
+
+def _load_state() -> Dict[str, Any]:
+    """加载插件状态（预览缓存等）。"""
+    if STATE_FILE.exists():
+        try:
+            return json.loads(STATE_FILE.read_text(encoding="utf-8"))
+        except Exception:
+            return {}
+    return {}
+
+
+def _save_state(state: Dict[str, Any]) -> None:
+    """保存插件状态（预览缓存等）。"""
+    try:
+        _ensure_data_dir()
+        STATE_FILE.write_text(json.dumps(state, ensure_ascii=False, indent=2), encoding="utf-8")
+    except Exception as e:
+        logger.warning(f"保存状态失败: {e}")
+
+
+def _normalize_config(config: Any) -> Dict[str, Any]:
+    """将包含点号键的配置归一化为嵌套 dict，兼容多种 config 结构。"""
+    if not isinstance(config, dict):
+        return {}
+
+    def deep_merge(dst: Dict[str, Any], src: Dict[str, Any]) -> Dict[str, Any]:
+        for k, v in src.items():
+            if k in dst and isinstance(dst[k], dict) and isinstance(v, dict):
+                deep_merge(dst[k], v)
+            else:
+                dst[k] = v
+        return dst
+
+    def set_dotted(dst: Dict[str, Any], dotted_key: str, value: Any) -> None:
+        parts = [p for p in dotted_key.split(".") if p]
+        if not parts:
+            return
+        cur = dst
+        for p in parts[:-1]:
+            if p not in cur or not isinstance(cur.get(p), dict):
+                cur[p] = {}
+            cur = cur[p]
+        cur[parts[-1]] = value
+
+    out: Dict[str, Any] = {}
+    for k, v in config.items():
+        v_norm = _normalize_config(v) if isinstance(v, dict) else v
+        if isinstance(k, str) and "." in k:
+            set_dotted(out, k, v_norm)
+        else:
+            if k in out and isinstance(out.get(k), dict) and isinstance(v_norm, dict):
+                deep_merge(out[k], v_norm)  # type: ignore[arg-type]
+            else:
+                out[k] = v_norm
+    return out
 
 # 全局状态（用于 WebUI 和统计）
 _collector_stats: Dict[str, Any] = {
@@ -80,6 +158,7 @@ class CollectResult:
     duplicate: int = 0
     errors: List[str] = field(default_factory=list)
     preview_contents: List[Dict] = field(default_factory=list)  # 预览内容
+    preview_items: List[SNSContent] = field(default_factory=list, repr=False)  # 预览条目（用于确认写入）
     
     def summary(self) -> str:
         status = "✅" if self.success else "❌"
@@ -355,18 +434,16 @@ class SNSCollector:
     
     # 并发控制
     MAX_CONCURRENT_DETAILS = 3  # 最大并发获取详情数
-    MAX_CONCURRENT_IMAGES = 2   # 最大并发识图数
     
     def __init__(self, config: Dict[str, Any]):
-        self.config = config
-        self.platform_cfg = config.get("platform", {})
-        self.filter_cfg = config.get("filter", {})
-        self.memory_cfg = config.get("memory", {})
-        self.debug = config.get("debug", {}).get("enabled", False)
-        self.processing_cfg = config.get("processing", {})
+        self.config = _normalize_config(config)
+        self.platform_cfg = _normalize_config(self.config.get("platform", {}))
+        self.filter_cfg = _normalize_config(self.config.get("filter", {}))
+        self.memory_cfg = _normalize_config(self.config.get("memory", {}))
+        self.processing_cfg = _normalize_config(self.config.get("processing", {}))
+        self.debug = bool(_normalize_config(self.config.get("debug", {})).get("enabled", False))
         self._personality_cache: Optional[Dict[str, str]] = None
         self._semaphore_details = asyncio.Semaphore(self.MAX_CONCURRENT_DETAILS)
-        self._semaphore_images = asyncio.Semaphore(self.MAX_CONCURRENT_IMAGES)
         self._adapters: Dict[str, PlatformAdapter] = {}
     
     def _get_adapter(self, platform: str) -> PlatformAdapter:
@@ -412,27 +489,6 @@ class SNSCollector:
         match = re.search(r"feed_id:([A-Za-z0-9_-]+)", text)
         return match.group(1) if match else None
 
-    @staticmethod
-    def _load_feed_id_cache() -> None:
-        """加载 feed_id 缓存"""
-        global _feed_id_cache, _feed_id_cache_loaded
-        if _feed_id_cache_loaded:
-            return
-        
-        try:
-            # 从数据库加载已有的 feed_id
-            import asyncio
-            loop = asyncio.get_event_loop()
-            if loop.is_running():
-                # 如果在异步上下文中，标记为需要异步加载
-                _feed_id_cache_loaded = True
-                return
-            
-            # 同步加载（启动时）
-            _feed_id_cache_loaded = True
-        except Exception as e:
-            logger.warning(f"加载 feed_id 缓存失败: {e}")
-    
     async def _async_load_feed_id_cache(self) -> None:
         """异步加载 feed_id 缓存（按平台加载，避免全表扫描导致缓存缺失）"""
         global _feed_id_cache, _feed_id_cache_loaded
@@ -472,24 +528,6 @@ class SNSCollector:
         except Exception as e:
             logger.warning(f"异步加载 feed_id 缓存失败: {e}")
     
-    @staticmethod
-    def _load_state() -> Dict[str, Any]:
-        """加载采集状态"""
-        if STATE_FILE.exists():
-            try:
-                return json.loads(STATE_FILE.read_text())
-            except Exception:
-                pass
-        return {"last_feed_ids": {}, "last_collect_time": {}}
-    
-    @staticmethod
-    def _save_state(state: Dict[str, Any]) -> None:
-        """保存采集状态"""
-        try:
-            STATE_FILE.write_text(json.dumps(state, ensure_ascii=False, indent=2))
-        except Exception as e:
-            logger.warning(f"保存状态失败: {e}")
-    
     def _get_personality(self) -> Dict[str, str]:
         """获取 MaiBot 人格配置"""
         if self._personality_cache:
@@ -517,6 +555,7 @@ class SNSCollector:
         keyword: Optional[str] = None, 
         count: int = 10,
         preview_only: bool = False,  # 预览模式，不写入数据库
+        provided_contents: Optional[List[SNSContent]] = None,  # 直接写入提供的内容（用于 preview->collect 确认写入）
     ) -> CollectResult:
         """执行采集任务
         
@@ -525,6 +564,7 @@ class SNSCollector:
             keyword: 搜索关键词
             count: 采集数量
             preview_only: 预览模式，只返回结果不写入
+            provided_contents: 已完成筛选/详情的内容列表（跳过采集流程，直接进入写入阶段）
         """
         global _collector_stats
         
@@ -534,10 +574,18 @@ class SNSCollector:
         keyword = keyword.strip() if isinstance(keyword, str) else keyword
         if keyword == "":
             keyword = None
-        count = max(int(count or 0), 0)
-        if count == 0:
-            result.errors.append("采集数量必须大于 0")
-            return result
+
+        if provided_contents is not None:
+            contents = [c for c in (provided_contents or []) if isinstance(c, SNSContent)]
+            result.fetched = len(contents)
+            if not contents:
+                result.success = True
+                return result
+        else:
+            count = max(int(count or 0), 0)
+            if count == 0:
+                result.errors.append("采集数量必须大于 0")
+                return result
 
         platform_config = self.platform_cfg.get(platform, {})
         if platform_config and not platform_config.get("enabled", True):
@@ -563,69 +611,72 @@ class SNSCollector:
         try:
             # 加载 feed_id 缓存
             await self._async_load_feed_id_cache()
-            # 1. 获取内容
-            if self.debug:
-                logger.info("[SNS] 📥 阶段1: 获取信息流...")
-            
-            contents = await self._fetch_contents(platform, keyword, count)
-            result.fetched = len(contents)
-            
-            if self.debug:
-                logger.info(f"[SNS] ✓ 获取到 {len(contents)} 条内容")
-                for i, c in enumerate(contents):
-                    logger.info(f"[SNS]    [{i+1}] {c.title[:50]}{'...' if len(c.title) > 50 else ''}")
-                    logger.info(f"[SNS]        👍 {c.like_count} | 💬 {c.comment_count} | 📝 {len(c.content)}字 | @{c.author}")
-            
-            if not contents:
+            if provided_contents is None:
+                # 1. 获取内容
                 if self.debug:
-                    logger.info("[SNS] ⚠️ 未获取到内容，结束")
-                result.success = True
-                return result
-            
-            # 2. 基础过滤（点赞数、黑白名单）
-            if self.debug:
-                logger.info("-" * 60)
-                logger.info("[SNS] 🔍 阶段2: 基础过滤（点赞数/黑白名单）...")
-                logger.info(f"[SNS]    最小点赞数: {self.filter_cfg.get('min_like_count', 100)}")
-            
-            filtered = self._filter_contents(contents)
-            result.filtered = result.fetched - len(filtered)
-            
-            if self.debug:
-                logger.info(f"[SNS] ✓ 基础过滤: {len(contents)} → {len(filtered)} 条（过滤 {result.filtered} 条）")
-            
-            # 3. 人格兴趣匹配（LLM 判断是否符合 MaiBot 兴趣）
-            if self.debug:
-                logger.info("-" * 60)
-                logger.info("[SNS] 🧠 阶段3: 人格兴趣匹配...")
-                personality = self._get_personality()
-                logger.info(f"[SNS]    兴趣配置: {personality.get('interest', '(未配置)')[:80]}...")
-            
-            before_match = len(filtered)
-            filtered = await self._match_personality_interest(filtered)
-            result.filtered += before_match - len(filtered)
-            
-            if self.debug:
-                logger.info(f"[SNS] ✓ 人格匹配: {before_match} → {len(filtered)} 条")
-                if filtered:
-                    logger.info("[SNS]    感兴趣的内容:")
-                    for c in filtered:
-                        logger.info(f"[SNS]      ✓ {c.title[:40]}...")
-            
-            if not filtered:
+                    logger.info("[SNS] 📥 阶段1: 获取信息流...")
+
+                contents = await self._fetch_contents(platform, keyword, count)
+                result.fetched = len(contents)
+
                 if self.debug:
-                    logger.info("[SNS] ⚠️ 没有符合兴趣的内容，结束")
-                result.success = True
-                return result
-            
-            # 4. 获取详情（只对感兴趣的内容获取完整正文）
-            fetch_detail = platform_config.get("fetch_detail", True)
-            if fetch_detail:
+                    logger.info(f"[SNS] ✓ 获取到 {len(contents)} 条内容")
+                    for i, c in enumerate(contents):
+                        logger.info(f"[SNS]    [{i+1}] {c.title[:50]}{'...' if len(c.title) > 50 else ''}")
+                        logger.info(f"[SNS]        👍 {c.like_count} | 💬 {c.comment_count} | 📝 {len(c.content)}字 | @{c.author}")
+
+                if not contents:
+                    if self.debug:
+                        logger.info("[SNS] ⚠️ 未获取到内容，结束")
+                    result.success = True
+                    return result
+
+                # 2. 基础过滤（点赞数、黑白名单）
                 if self.debug:
                     logger.info("-" * 60)
-                    logger.info("[SNS] 📄 阶段4: 获取详情（正文+图片）...")
-                filtered = await self._fetch_details(filtered, platform)
-            
+                    logger.info("[SNS] 🔍 阶段2: 基础过滤（点赞数/黑白名单）...")
+                    logger.info(f"[SNS]    最小点赞数: {self.filter_cfg.get('min_like_count', 100)}")
+
+                filtered = self._filter_contents(contents)
+                result.filtered = result.fetched - len(filtered)
+
+                if self.debug:
+                    logger.info(f"[SNS] ✓ 基础过滤: {len(contents)} → {len(filtered)} 条（过滤 {result.filtered} 条）")
+
+                # 3. 人格兴趣匹配（LLM 判断是否符合 MaiBot 兴趣）
+                if self.debug:
+                    logger.info("-" * 60)
+                    logger.info("[SNS] 🧠 阶段3: 人格兴趣匹配...")
+                    personality = self._get_personality()
+                    logger.info(f"[SNS]    兴趣配置: {personality.get('interest', '(未配置)')[:80]}...")
+
+                before_match = len(filtered)
+                filtered = await self._match_personality_interest(filtered)
+                result.filtered += before_match - len(filtered)
+
+                if self.debug:
+                    logger.info(f"[SNS] ✓ 人格匹配: {before_match} → {len(filtered)} 条")
+                    if filtered:
+                        logger.info("[SNS]    感兴趣的内容:")
+                        for c in filtered:
+                            logger.info(f"[SNS]      ✓ {c.title[:40]}...")
+
+                if not filtered:
+                    if self.debug:
+                        logger.info("[SNS] ⚠️ 没有符合兴趣的内容，结束")
+                    result.success = True
+                    return result
+
+                # 4. 获取详情（只对感兴趣的内容获取完整正文）
+                fetch_detail = platform_config.get("fetch_detail", True)
+                if fetch_detail:
+                    if self.debug:
+                        logger.info("-" * 60)
+                        logger.info("[SNS] 📄 阶段4: 获取详情（正文+图片）...")
+                    filtered = await self._fetch_details(filtered, platform)
+            else:
+                filtered = contents
+
             # 5. 写入记忆（或预览）
             if self.debug:
                 logger.info("-" * 60)
@@ -657,6 +708,7 @@ class SNSCollector:
                             "like_count": content.like_count,
                             "image_count": len(content.image_urls),
                         })
+                        result.preview_items.append(content)
                         result.written += 1
                     else:
                         await self._write_to_memory(content, platform)
@@ -722,7 +774,6 @@ class SNSCollector:
     async def _fetch_contents(self, platform: str, keyword: Optional[str], count: int) -> List[SNSContent]:
         """通过MCP工具获取内容（使用平台适配器）"""
         contents = []
-        result = None
         
         # 获取平台适配器
         adapter = self._get_adapter(platform)
@@ -960,30 +1011,6 @@ class SNSCollector:
             logger.warning(f"人格兴趣匹配失败: {e}")
             return contents
     
-    async def _check_duplicate(self, content: SNSContent) -> bool:
-        """检查是否重复"""
-        if not content.feed_id:
-            return False
-        
-        # 通过feed_id检查（在key_point中存储了feed_id）
-        try:
-            records = await database_api.db_get(
-                ChatHistory,
-                filters={"chat_id": f"sns_{content.platform}"},
-                limit=200,
-            )
-            
-            if records:
-                for r in records:
-                    key_point = r.get("key_point", "") or ""
-                    if f"feed_id:{content.feed_id}" in key_point:
-                        return True
-            
-            return False
-        except Exception as e:
-            logger.warning(f"检查重复失败: {e}")
-            return False
-    
     async def _write_to_memory(self, content: SNSContent, platform: str) -> None:
         """写入ChatHistory"""
         # 生成摘要
@@ -1112,11 +1139,12 @@ class SNSCollector:
     def _cache_failed_write(self, data: Dict) -> None:
         """缓存写入失败的数据"""
         try:
+            _ensure_data_dir()
             cache = []
             if CACHE_FILE.exists():
-                cache = json.loads(CACHE_FILE.read_text())
+                cache = json.loads(CACHE_FILE.read_text(encoding="utf-8"))
             cache.append({"data": data, "time": time.time()})
-            CACHE_FILE.write_text(json.dumps(cache, ensure_ascii=False, indent=2))
+            CACHE_FILE.write_text(json.dumps(cache, ensure_ascii=False, indent=2), encoding="utf-8")
         except Exception as e:
             logger.error(f"缓存失败: {e}")
     
@@ -1126,7 +1154,7 @@ class SNSCollector:
             return 0
         
         try:
-            cache = json.loads(CACHE_FILE.read_text())
+            cache = json.loads(CACHE_FILE.read_text(encoding="utf-8"))
             success = 0
             remaining = []
             
@@ -1138,7 +1166,7 @@ class SNSCollector:
                     remaining.append(item)
             
             if remaining:
-                CACHE_FILE.write_text(json.dumps(remaining, ensure_ascii=False, indent=2))
+                CACHE_FILE.write_text(json.dumps(remaining, ensure_ascii=False, indent=2), encoding="utf-8")
             else:
                 CACHE_FILE.unlink()
             
@@ -1444,15 +1472,69 @@ class SNSCommand(BaseCommand):
         
         config = _get_config()
         collector = SNSCollector(config)
+        stream_id = getattr(getattr(self.message, "chat_stream", None), "stream_id", "") or ""
         
         if action == "collect":
+            keyword = arg.strip() if isinstance(arg, str) else ""
+
+            if keyword:
+                result = await collector.collect(keyword=keyword)
+                await self.send_text(f"SNS采集完成\n{result.summary()}")
+                return True, "命令执行完成", True
+
+            # 无参数：优先作为 preview 的确认写入
+            state = _load_state()
+            preview = (state.get("preview") or {}).get(stream_id) if stream_id else None
+            preview_ttl = 15 * 60  # 15 分钟内允许确认写入
+            if isinstance(preview, dict) and preview.get("ts") and (time.time() - float(preview["ts"])) <= preview_ttl:
+                items_data = preview.get("items") or []
+                items: List[SNSContent] = []
+                if isinstance(items_data, list):
+                    for d in items_data:
+                        if isinstance(d, dict):
+                            try:
+                                items.append(
+                                    SNSContent(
+                                        feed_id=str(d.get("feed_id", "")),
+                                        platform=str(d.get("platform", "xiaohongshu")),
+                                        title=str(d.get("title", "")),
+                                        content=str(d.get("content", "")),
+                                        author=str(d.get("author", "")),
+                                        like_count=int(d.get("like_count", 0) or 0),
+                                        comment_count=int(d.get("comment_count", 0) or 0),
+                                        image_urls=list(d.get("image_urls") or []),
+                                        url=str(d.get("url", "")),
+                                        extra=dict(d.get("extra") or {}),
+                                    )
+                                )
+                            except Exception:
+                                continue
+
+                if items:
+                    result = await collector.collect(
+                        platform=items[0].platform or "xiaohongshu",
+                        provided_contents=items,
+                        count=len(items),
+                        preview_only=False,
+                    )
+                    # 确认后清空预览缓存
+                    try:
+                        if stream_id and isinstance(state.get("preview"), dict) and stream_id in state["preview"]:
+                            del state["preview"][stream_id]
+                            _save_state(state)
+                    except Exception:
+                        pass
+                    await self.send_text(f"SNS写入（来自预览确认）完成\n{result.summary()}")
+                    return True, "命令执行完成", True
+
             result = await collector.collect()
             await self.send_text(f"SNS采集完成\n{result.summary()}")
         
         elif action == "preview":
             # 预览模式：只获取内容，不写入数据库
             await self.send_text("👁️ 预览模式：获取内容中...")
-            result = await collector.collect(keyword=arg if arg else None, preview_only=True)
+            keyword = arg.strip() if isinstance(arg, str) else ""
+            result = await collector.collect(keyword=keyword if keyword else None, preview_only=True)
             
             if hasattr(result, 'preview_contents') and result.preview_contents:  # type: ignore
                 preview_text = f"📋 预览结果 ({len(result.preview_contents)} 条):\n\n"  # type: ignore
@@ -1465,6 +1547,17 @@ class SNSCommand(BaseCommand):
                     preview_text += f"... 还有 {len(result.preview_contents) - 5} 条\n"  # type: ignore
                 preview_text += "\n使用 /sns collect 确认写入"
                 await self.send_text(preview_text)
+
+                # 保存预览缓存，供 /sns collect 确认写入
+                if stream_id and result.preview_items:
+                    state = _load_state()
+                    state.setdefault("preview", {})
+                    state["preview"][stream_id] = {
+                        "ts": time.time(),
+                        "keyword": keyword,
+                        "items": [asdict(c) for c in result.preview_items],
+                    }
+                    _save_state(state)
             else:
                 await self.send_text(f"预览完成\n{result.summary()}\n（无符合条件的内容）")
         
@@ -1585,13 +1678,14 @@ class SNSScheduler:
         """启动调度器"""
         if self.running:
             return
-        
-        self.running = True
-        interval = self.config.get("scheduler", {}).get("interval_minutes", 60) * 60
-        
+
+        interval = float(self.config.get("scheduler", {}).get("interval_minutes", 60) or 0) * 60
         if interval <= 0:
+            self.running = False
             logger.info("SNS定时任务已禁用")
             return
+
+        self.running = True
         
         self._task = asyncio.create_task(self._run_loop(interval))
         logger.info(f"SNS定时任务启动，间隔{interval // 60}分钟")
@@ -1651,7 +1745,7 @@ def _get_config() -> Dict[str, Any]:
     """获取插件配置"""
     global _plugin_instance
     if _plugin_instance and hasattr(_plugin_instance, "config"):
-        return _plugin_instance.config
+        return _normalize_config(_plugin_instance.config)
     return {}
 
 
@@ -1725,56 +1819,59 @@ def _register_memory_retrieval_tools() -> None:
                 if not platforms:
                     platforms = [p for p in platform_cfg.keys()] or ["xiaohongshu"]
 
-                max_records = int(config.get("memory", {}).get("max_records", 1000) or 1000) if isinstance(config, dict) else 1000
-                max_records = max(max_records, 0)
+                # 关键词解析：复用 MaiBot 的统一规则（含空格/逗号/斜杠等）
+                try:
+                    from src.chat.utils.utils import parse_keywords_string
 
-                records: List[Dict[str, Any]] = []
-                for p in platforms:
-                    chunk = await database_api.db_get(
-                        ChatHistory,
-                        filters={"chat_id": f"sns_{p}"},
-                        order_by="-start_time",
-                        limit=min(max_records, 1000) + 200,
+                    keywords = parse_keywords_string(keyword) or []
+                except Exception:
+                    keywords = []
+
+                if not keywords:
+                    keywords = [kw for kw in (keyword or "").split() if kw.strip()]
+                keywords = [kw.strip() for kw in keywords if kw and kw.strip()]
+                if not keywords:
+                    return "请提供有效的搜索关键词"
+
+                # Peewee 直接查询（避免全量拉取到内存）
+                chat_ids = [f"sns_{p}" for p in platforms]
+                query = ChatHistory.select(
+                    ChatHistory.id,
+                    ChatHistory.chat_id,
+                    ChatHistory.theme,
+                    ChatHistory.keywords,
+                    ChatHistory.summary,
+                    ChatHistory.start_time,
+                ).where(ChatHistory.chat_id.in_(chat_ids))
+
+                kw_cond = None
+                for kw in keywords:
+                    c = (
+                        (ChatHistory.theme.contains(kw))
+                        | (ChatHistory.summary.contains(kw))
+                        | (ChatHistory.keywords.contains(kw))
+                        | (ChatHistory.original_text.contains(kw))
                     )
-                    for r in (chunk or []):
-                        r = dict(r)
-                        r["_sns_platform"] = p
-                        records.append(r)
+                    kw_cond = c if kw_cond is None else (kw_cond | c)
 
+                if kw_cond is not None:
+                    query = query.where(kw_cond)
+
+                records = list(query.order_by(ChatHistory.start_time.desc()).limit(50))
                 if not records:
-                    return "未找到任何 SNS 记忆"
-                
-                # 筛选 SNS 记录并匹配关键词
-                keywords_lower = [kw.lower().strip() for kw in keyword.split() if kw.strip()]
-                matched = []
-                
-                for r in records:
-                    # 在 theme、summary、keywords 中搜索
-                    theme = (r.get("theme") or "").lower()
-                    summary = (r.get("summary") or "").lower()
-                    record_keywords = (r.get("keywords") or "").lower()
-                    
-                    # 检查是否匹配任一关键词
-                    for kw in keywords_lower:
-                        if kw in theme or kw in summary or kw in record_keywords:
-                            matched.append(r)
-                            break
-                
-                if not matched:
                     return f"未找到包含关键词「{keyword}」的 SNS 记忆"
-                
-                # 构建结果
+
                 results = []
-                for r in matched[:10]:  # 最多返回10条
-                    platform = r.get("_sns_platform") or r.get("chat_id", "").replace("sns_", "")
+                for r in records[:10]:
+                    platform = (getattr(r, "chat_id", "") or "").replace("sns_", "")
                     results.append(
-                        f"记忆ID：{r.get('id')}\n"
+                        f"记忆ID：{getattr(r, 'id', None)}\n"
                         f"来源：{platform}\n"
-                        f"主题：{r.get('theme', '(无)')}\n"
-                        f"关键词：{r.get('keywords', '(无)')}"
+                        f"主题：{getattr(r, 'theme', '(无)') or '(无)'}\n"
+                        f"关键词：{getattr(r, 'keywords', '(无)') or '(无)'}"
                     )
-                
-                return f"找到 {len(matched)} 条 SNS 记忆（显示前{len(results)}条）：\n\n" + "\n\n---\n\n".join(results)
+
+                return f"找到 {len(records)} 条 SNS 记忆（显示前{len(results)}条）：\n\n" + "\n\n---\n\n".join(results)
                 
             except Exception as e:
                 logger.error(f"搜索 SNS 记忆失败: {e}")
@@ -1788,18 +1885,20 @@ def _register_memory_retrieval_tools() -> None:
                 if not id_list:
                     return "请提供有效的记忆ID"
 
-                matched: List[Dict[str, Any]] = []
-                for record_id in id_list:
-                    try:
-                        records = await database_api.db_get(
-                            ChatHistory,
-                            filters={"id": record_id},
-                            limit=1,
-                        )
-                        if records:
-                            matched.append(records[0])
-                    except Exception:
-                        continue
+                # 只允许读取 sns_* 记录，避免通过 ID 读取非 SNS 记忆
+                query = (
+                    ChatHistory.select(
+                        ChatHistory.id,
+                        ChatHistory.chat_id,
+                        ChatHistory.theme,
+                        ChatHistory.summary,
+                        ChatHistory.keywords,
+                        ChatHistory.start_time,
+                    )
+                    .where(ChatHistory.id.in_(id_list))
+                    .where(ChatHistory.chat_id.startswith("sns_"))
+                )
+                matched = list(query.limit(len(id_list)))
                 
                 if not matched:
                     return f"未找到ID为 {id_list} 的记忆"
@@ -1808,14 +1907,14 @@ def _register_memory_retrieval_tools() -> None:
                 results = []
                 for r in matched:
                     parts = [
-                        f"记忆ID：{r.get('id')}",
-                        f"来源：{r.get('chat_id', '').replace('sns_', '')}",
-                        f"主题：{r.get('theme', '(无)')}",
+                        f"记忆ID：{getattr(r, 'id', None)}",
+                        f"来源：{(getattr(r, 'chat_id', '') or '').replace('sns_', '')}",
+                        f"主题：{getattr(r, 'theme', '(无)') or '(无)'}",
                     ]
-                    if r.get("summary"):
-                        parts.append(f"概括：{r.get('summary')}")
-                    if r.get("keywords"):
-                        parts.append(f"关键词：{r.get('keywords')}")
+                    if getattr(r, "summary", None):
+                        parts.append(f"概括：{getattr(r, 'summary')}")
+                    if getattr(r, "keywords", None):
+                        parts.append(f"关键词：{getattr(r, 'keywords')}")
                     results.append("\n".join(parts))
                 
                 return "\n\n" + ("=" * 50) + "\n\n" + "\n\n".join(results)
@@ -1917,13 +2016,16 @@ class MaiBotSNSPlugin(BasePlugin):
     """MaiBot SNS插件"""
     
     plugin_name = "maibot_sns"
-    plugin_version = "1.0.0"
-    plugin_description = "社交平台内容采集与记忆写入插件，让 MaiBot 从小红书等平台学习知识"
-    plugin_author = "CharTyr"
-    display_name = "SNS 社交采集"
     enable_plugin = True
     dependencies = ["mcp_bridge_plugin"]
-    python_dependencies = []
+    python_dependencies = [
+        PythonDependency(
+            package_name="aiohttp",
+            version="",
+            optional=True,
+            description="用于下载图片并转为 base64（图片识别功能需要）",
+        ),
+    ]
     config_file_name = "config.toml"
     
     def __init__(self, *args, **kwargs):

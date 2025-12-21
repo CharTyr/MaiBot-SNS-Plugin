@@ -2,7 +2,7 @@
   "manifest_version": 1,
   "name": "MaiBot_SNS - 社交平台采集插件",
   "version": "1.0.0",
-  "description": "通过MCP桥接插件与MaiBot的做梦模块集成采集社交平台内容（如小红书），写入ChatHistory记忆系统，以供日后对话时调取使用（需开启全局ChatHistory）的MaiBot插件",
+  "description": "通过 MCP 桥接采集小红书等社交平台内容，写入 ChatHistory 记忆系统，并注册专用 SNS 记忆检索工具供回忆使用（不依赖 global_memory/全局记忆开关）。支持做梦模块集成、定时任务与手动命令触发。",
   "author": {
     "name": "CharTyr",
     "url": "https://github.com/CharTyr"
@@ -38,10 +38,15 @@
         "description": "清理过期的社交平台记忆"
       },
       {
+        "type": "tool",
+        "name": "sns_get_status",
+        "description": "获取 SNS 采集插件的运行状态和统计信息（WebUI 使用）"
+      },
+      {
         "type": "command",
         "name": "sns_command",
         "description": "社交平台采集命令",
-        "pattern": "/sns [collect|search|status|cleanup|config]"
+        "pattern": "/sns [collect|search|status|cleanup|config|dream|preview|stats]"
       }
     ],
     "features": [
