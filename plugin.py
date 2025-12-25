@@ -5,8 +5,6 @@ MaiBot_SNS - 社交平台信息采集与记忆写入插件
 支持做梦模块集成、定时任务和手动命令触发。
 """
 
-from __future__ import annotations
-
 import asyncio
 import json
 import os
